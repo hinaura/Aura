@@ -1,0 +1,692 @@
+name: 'Maximize build disk space and build auraOS kernel'
+description: 'Maximize build disk space, download Linux 6.8.0-138 sources, enable a broad driver set, and build the auraOS kernel'
+branding:
+  icon: 'cpu'
+  color: 'orange'
+
+inputs:
+  root-reserve-mb:
+    description: 'Space to be left free on the root filesystem, in Megabytes.'
+    required: false
+    default: '1024'
+
+  temp-reserve-mb:
+    description: 'Space to be left free on the temp filesystem (/mnt), in Megabytes.'
+    required: false
+    default: '100'
+
+  swap-size-mb:
+    description: 'Swap space to create, in Megabytes.'
+    required: false
+    default: '4096'
+
+  overprovision-lvm:
+    description: |
+      Create the LVM disk images as sparse files, making the space required for the LVM image files
+      appear unused on the hosting volumes until actually allocated.
+    required: false
+    default: 'false'
+
+  build-mount-path:
+    description: 'Absolute path to the mount point where the build space will be available, defaults to $GITHUB_WORKSPACE if unset.'
+    required: false
+
+  build-mount-path-ownership:
+    description: 'Ownership of the mount point path, defaults to standard "runner" user and group.'
+    required: false
+    default: 'runner:runner'
+
+  pv-loop-path:
+    description: 'Absolute file path for the LVM image created on the root filesystem.'
+    required: false
+    default: '/pv.img'
+
+  tmp-pv-loop-path:
+    description: 'Absolute file path for the LVM image created on the temp filesystem.'
+    required: false
+    default: '/mnt/tmp-pv.img'
+
+  remove-dotnet:
+    description: 'Removes .NET runtime and libraries. (frees ~17 GB)'
+    required: false
+    default: 'false'
+
+  remove-android:
+    description: 'Removes Android SDKs and Tools. (frees ~11 GB)'
+    required: false
+    default: 'false'
+
+  remove-haskell:
+    description: 'Removes GHC (Haskell) artifacts. (frees ~2.7 GB)'
+    required: false
+    default: 'false'
+
+  remove-codeql:
+    description: 'Removes CodeQL Action Bundles. (frees ~5.4 GB)'
+    required: false
+    default: 'false'
+
+  remove-docker-images:
+    description: 'Removes cached Docker images. (frees ~3 GB)'
+    required: false
+    default: 'false'
+
+  kernel-version:
+    description: 'Ubuntu Linux kernel source version to build.'
+    required: false
+    default: '6.8.0-138'
+
+  kernel-localversion:
+    description: 'Additional local version appended to the kernel release.'
+    required: false
+    default: '-generic-auraOS'
+
+  kernel-build-user:
+    description: 'Kernel build user metadata.'
+    required: false
+    default: 'aura'
+
+  kernel-build-host:
+    description: 'Kernel build host metadata.'
+    required: false
+    default: 'aura'
+
+  kernel-config:
+    description: |
+      Kernel configuration mode. allmodconfig enables the broadest possible set of
+      loadable modules supported by the selected architecture.
+    required: false
+    default: 'allmodconfig'
+
+runs:
+  using: "composite"
+  steps:
+
+    - name: Disk space report before modification
+      shell: bash
+      run: |
+        echo "Memory and swap:"
+        sudo free -h
+        echo
+        sudo swapon --show
+        echo
+
+        echo "Available storage:"
+        sudo df -h
+        echo
+
+    - name: Maximize build disk space
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        BUILD_MOUNT_PATH="${{ inputs.build-mount-path }}"
+        if [[ -z "${BUILD_MOUNT_PATH}" ]]; then
+          BUILD_MOUNT_PATH="${GITHUB_WORKSPACE}"
+        fi
+
+        echo "Arguments:"
+        echo
+        echo "  Root reserve:      ${{ inputs.root-reserve-mb }} MiB"
+        echo "  Temp reserve:      ${{ inputs.temp-reserve-mb }} MiB"
+        echo "  Swap space:        ${{ inputs.swap-size-mb }} MiB"
+        echo "  Overprovision LVM: ${{ inputs.overprovision-lvm }}"
+        echo "  Mount path:        ${BUILD_MOUNT_PATH}"
+        echo "  Root PV loop path: ${{ inputs.pv-loop-path }}"
+        echo "  Temp PV loop path: ${{ inputs.tmp-pv-loop-path }}"
+
+        echo -n "  Removing:          "
+
+        if [[ "${{ inputs.remove-dotnet }}" == 'true' ]]; then
+          echo -n "dotnet "
+        fi
+
+        if [[ "${{ inputs.remove-android }}" == 'true' ]]; then
+          echo -n "android "
+        fi
+
+        if [[ "${{ inputs.remove-haskell }}" == 'true' ]]; then
+          echo -n "haskell "
+        fi
+
+        if [[ "${{ inputs.remove-codeql }}" == 'true' ]]; then
+          echo -n "codeql "
+        fi
+
+        if [[ "${{ inputs.remove-docker-images }}" == 'true' ]]; then
+          echo -n "docker "
+        fi
+
+        echo
+
+        WORKSPACE_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"
+
+        sudo mkdir -p "${BUILD_MOUNT_PATH}"
+
+        sudo find "${BUILD_MOUNT_PATH}" \
+          -maxdepth 0 \
+          ! -empty \
+          -exec echo 'WARNING: directory [{}] is not empty, data loss might occur. Content:' \; \
+          -exec ls -al "{}" \;
+
+        echo "Removing unwanted software..."
+
+        if [[ "${{ inputs.remove-dotnet }}" == 'true' ]]; then
+          sudo rm -rf /usr/share/dotnet
+        fi
+
+        if [[ "${{ inputs.remove-android }}" == 'true' ]]; then
+          sudo rm -rf /usr/local/lib/android
+        fi
+
+        if [[ "${{ inputs.remove-haskell }}" == 'true' ]]; then
+          sudo rm -rf /opt/ghc
+        fi
+
+        if [[ "${{ inputs.remove-codeql }}" == 'true' ]]; then
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+        fi
+
+        if [[ "${{ inputs.remove-docker-images }}" == 'true' ]]; then
+          sudo docker image prune --all --force
+        fi
+
+        echo "... done"
+
+        VG_NAME=buildvg
+
+        echo "Unmounting and removing swap file."
+        sudo swapoff -a || true
+        sudo rm -f /mnt/swapfile
+
+        echo "Creating LVM Volume."
+
+        echo "  Creating LVM PV on root fs."
+
+        ROOT_RESERVE_KB=$(expr "${{ inputs.root-reserve-mb }}" \* 1024)
+        ROOT_FREE_KB=$(df --block-size=1024 --output=avail / | tail -1)
+        ROOT_LVM_SIZE_KB=$(expr "${ROOT_FREE_KB}" - "${ROOT_RESERVE_KB}")
+        ROOT_LVM_SIZE_BYTES=$(expr "${ROOT_LVM_SIZE_KB}" \* 1024)
+
+        sudo touch "${{ inputs.pv-loop-path }}"
+        sudo fallocate -z -l "${ROOT_LVM_SIZE_BYTES}" "${{ inputs.pv-loop-path }}"
+
+        export ROOT_LOOP_DEV=$(sudo losetup --find --show "${{ inputs.pv-loop-path }}")
+        sudo pvcreate -f "${ROOT_LOOP_DEV}"
+
+        echo "  Creating LVM PV on temp fs."
+
+        TMP_RESERVE_KB=$(expr "${{ inputs.temp-reserve-mb }}" \* 1024)
+        TMP_FREE_KB=$(df --block-size=1024 --output=avail /mnt | tail -1)
+        TMP_LVM_SIZE_KB=$(expr "${TMP_FREE_KB}" - "${TMP_RESERVE_KB}")
+        TMP_LVM_SIZE_BYTES=$(expr "${TMP_LVM_SIZE_KB}" \* 1024)
+
+        sudo touch "${{ inputs.tmp-pv-loop-path }}"
+        sudo fallocate -z -l "${TMP_LVM_SIZE_BYTES}" "${{ inputs.tmp-pv-loop-path }}"
+
+        export TMP_LOOP_DEV=$(sudo losetup --find --show "${{ inputs.tmp-pv-loop-path }}")
+        sudo pvcreate -f "${TMP_LOOP_DEV}"
+
+        sudo vgcreate "${VG_NAME}" "${TMP_LOOP_DEV}" "${ROOT_LOOP_DEV}"
+
+        echo "Recreating swap."
+
+        sudo lvcreate \
+          -L "${{ inputs.swap-size-mb }}M" \
+          -n swap \
+          "${VG_NAME}"
+
+        sudo mkswap "/dev/mapper/${VG_NAME}-swap"
+        sudo swapon "/dev/mapper/${VG_NAME}-swap"
+
+        echo "Creating build volume."
+
+        sudo lvcreate \
+          -l 100%FREE \
+          -n buildlv \
+          "${VG_NAME}"
+
+        if [[ "${{ inputs.overprovision-lvm }}" == 'true' ]]; then
+          sudo mkfs.ext4 -m0 "/dev/mapper/${VG_NAME}-buildlv"
+        else
+          sudo mkfs.ext4 -Enodiscard -m0 "/dev/mapper/${VG_NAME}-buildlv"
+        fi
+
+        sudo mount \
+          "/dev/mapper/${VG_NAME}-buildlv" \
+          "${BUILD_MOUNT_PATH}"
+
+        sudo chown -R \
+          "${{ inputs.build-mount-path-ownership }}" \
+          "${BUILD_MOUNT_PATH}"
+
+        if [[ ! -d "${GITHUB_WORKSPACE}" ]]; then
+          sudo mkdir -p "${GITHUB_WORKSPACE}"
+          sudo chown -R "${WORKSPACE_OWNER}" "${GITHUB_WORKSPACE}"
+        fi
+
+    - name: Install kernel build dependencies
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        sudo apt-get update
+
+        sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+          build-essential \
+          bc \
+          bison \
+          flex \
+          libssl-dev \
+          libelf-dev \
+          libdw-dev \
+          dwarves \
+          pkg-config \
+          cpio \
+          rsync \
+          kmod \
+          fakeroot \
+          dpkg-dev \
+          debhelper \
+          flex \
+          bison \
+          libncurses-dev \
+          git \
+          wget \
+          curl \
+          xz-utils \
+          zstd \
+          ca-certificates
+
+    - name: Download Linux 6.8.0-138 source
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+
+        KERNEL_VERSION="${{ inputs.kernel-version }}"
+        SOURCE_VERSION="6.8.0-138.138"
+
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${KERNEL_VERSION}"
+
+        mkdir -p "${BUILD_ROOT}"
+
+        echo "Downloading Ubuntu Linux source ${SOURCE_VERSION}..."
+
+        SOURCE_DEB_URL="https://mirrors.mit.edu/ubuntu/pool/main/l/linux/linux-source-6.8.0_${SOURCE_VERSION}_all.deb"
+
+        curl \
+          --fail \
+          --location \
+          --retry 5 \
+          --retry-delay 3 \
+          --connect-timeout 30 \
+          -o "${BUILD_ROOT}/linux-source-6.8.0_${SOURCE_VERSION}_all.deb" \
+          "${SOURCE_DEB_URL}"
+
+        echo "Extracting kernel source..."
+
+        dpkg-deb \
+          -x \
+          "${BUILD_ROOT}/linux-source-6.8.0_${SOURCE_VERSION}_all.deb" \
+          "${BUILD_ROOT}/source-package"
+
+        SOURCE_TARBALL="$(
+          find "${BUILD_ROOT}/source-package" \
+            -type f \
+            \( -name "linux-source-6.8.0.tar.bz2" -o -name "linux-source-6.8.0.tar.xz" -o -name "linux-source-6.8.0.tar.zst" \) \
+            | head -n 1
+        )"
+
+        if [[ -z "${SOURCE_TARBALL}" ]]; then
+          echo "ERROR: Linux source archive was not found."
+          find "${BUILD_ROOT}/source-package" -maxdepth 4 -type f | head -100
+          exit 1
+        fi
+
+        mkdir -p "${SOURCE_DIR}"
+
+        case "${SOURCE_TARBALL}" in
+          *.tar.bz2)
+            tar -xjf "${SOURCE_TARBALL}" \
+              --strip-components=1 \
+              -C "${SOURCE_DIR}"
+            ;;
+          *.tar.xz)
+            tar -xJf "${SOURCE_TARBALL}" \
+              --strip-components=1 \
+              -C "${SOURCE_DIR}"
+            ;;
+          *.tar.zst)
+            tar --zstd -xf "${SOURCE_TARBALL}" \
+              --strip-components=1 \
+              -C "${SOURCE_DIR}"
+            ;;
+          *)
+            echo "Unsupported source archive: ${SOURCE_TARBALL}"
+            exit 1
+            ;;
+        esac
+
+        echo "Kernel source:"
+        echo "  ${SOURCE_DIR}"
+
+        test -f "${SOURCE_DIR}/Makefile"
+        test -d "${SOURCE_DIR}/drivers"
+
+        echo "Detected kernel Makefile:"
+        head -n 8 "${SOURCE_DIR}/Makefile"
+
+        echo "Number of driver source directories:"
+        find "${SOURCE_DIR}/drivers" -mindepth 1 -maxdepth 1 -type d | wc -l
+
+    - name: Configure auraOS kernel with broad driver support
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+
+        KERNEL_VERSION="${{ inputs.kernel-version }}"
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${KERNEL_VERSION}"
+
+        cd "${SOURCE_DIR}"
+
+        echo "Preparing kernel configuration..."
+
+        make mrproper
+
+        case "${{ inputs.kernel-config }}" in
+          allmodconfig)
+            make allmodconfig
+            ;;
+          allyesconfig)
+            make allyesconfig
+            ;;
+          allnoconfig)
+            make allnoconfig
+            ;;
+          *)
+            echo "Unknown kernel-config: ${{ inputs.kernel-config }}"
+            exit 1
+            ;;
+        esac
+
+        ./scripts/config \
+          --enable CONFIG_MODULES \
+          --enable CONFIG_KALLSYMS \
+          --enable CONFIG_KALLSYMS_ALL \
+          --enable CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT \
+          --disable CONFIG_LOCALVERSION_AUTO \
+          --set-str CONFIG_LOCALVERSION "${{ inputs.kernel-localversion }}"
+
+        if grep -q '^CONFIG_X86_64=y' .config; then
+          ./scripts/config \
+            --enable CONFIG_64BIT \
+            --enable CONFIG_X86_64 \
+            --enable CONFIG_X86 \
+            --enable CONFIG_IA32_EMULATION
+        fi
+
+        # Ensure common legacy buses / storage / input support remain enabled.
+        for option in \
+          CONFIG_PCI \
+          CONFIG_PCIEPORTBUS \
+          CONFIG_PCCARD \
+          CONFIG_ISA \
+          CONFIG_EISA \
+          CONFIG_MCA \
+          CONFIG_SCSI \
+          CONFIG_ATA \
+          CONFIG_SATA_AHCI \
+          CONFIG_IDE \
+          CONFIG_BLK_DEV \
+          CONFIG_MD \
+          CONFIG_DM_CRYPT \
+          CONFIG_VT \
+          CONFIG_VGA_CONSOLE \
+          CONFIG_DRM \
+          CONFIG_SOUND \
+          CONFIG_HID \
+          CONFIG_USB \
+          CONFIG_USB_SUPPORT \
+          CONFIG_NET \
+          CONFIG_INET \
+          CONFIG_IPV6 \
+          CONFIG_WLAN \
+          CONFIG_BT \
+          CONFIG_INPUT \
+          CONFIG_I2C \
+          CONFIG_SPI \
+          CONFIG_PNP \
+          CONFIG_ACPI \
+          CONFIG_HWMON \
+          CONFIG_RTC_CLASS \
+          CONFIG_MTD \
+          CONFIG_NVMEM \
+          CONFIG_FW_LOADER \
+          CONFIG_DEVTMPFS \
+          CONFIG_TMPFS
+        do
+          if grep -q "^${option}=y$" .config; then
+            continue
+          fi
+
+          if grep -q "^${option}=m$" .config; then
+            continue
+          fi
+
+          ./scripts/config --enable "${option}" 2>/dev/null || true
+        done
+
+        # Re-resolve dependencies after the manual changes.
+        make olddefconfig
+
+        echo "Kernel release configuration:"
+        grep -E \
+          '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT)=' \
+          .config || true
+
+        echo
+        echo "Kernel configuration summary:"
+        echo "  Build user : ${{ inputs.kernel-build-user }}"
+        echo "  Build host : ${{ inputs.kernel-build-host }}"
+        echo "  Localversion: ${{ inputs.kernel-localversion }}"
+
+        echo
+        echo "Driver configuration statistics:"
+        echo -n "  Built-in drivers: "
+        grep -Ec '^CONFIG_[A-Za-z0-9_]+=y$' .config || true
+
+        echo -n "  Module drivers:  "
+        grep -Ec '^CONFIG_[A-Za-z0-9_]+=m$' .config || true
+
+    - name: Build auraOS Linux kernel
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        KBUILD_BUILD_USER: ${{ inputs.kernel-build-user }}
+        KBUILD_BUILD_HOST: ${{ inputs.kernel-build-host }}
+        KBUILD_BUILD_TIMESTAMP: "2026-08-20 00:00:00"
+        KBUILD_BUILD_VERSION: "1"
+        LOCALVERSION: ${{ inputs.kernel-localversion }}
+      run: |
+        set -euo pipefail
+
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        KERNEL_VERSION="${{ inputs.kernel-version }}"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${KERNEL_VERSION}"
+        OUTPUT_DIR="${BUILD_ROOT}/output"
+
+        mkdir -p "${OUTPUT_DIR}"
+
+        cd "${SOURCE_DIR}"
+
+        echo "=============================================="
+        echo " Building auraOS Linux Kernel"
+        echo "=============================================="
+        echo "Version:      ${KERNEL_VERSION}"
+        echo "Release:      ${KERNEL_VERSION}${LOCALVERSION}"
+        echo "Build user:   ${KBUILD_BUILD_USER}"
+        echo "Build host:   ${KBUILD_BUILD_HOST}"
+        echo "Architecture: $(uname -m)"
+        echo "CPU count:    $(nproc)"
+        echo "=============================================="
+
+        make -j"$(nproc)" \
+          KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" \
+          KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" \
+          KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" \
+          KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" \
+          LOCALVERSION="${LOCALVERSION}" \
+          bzImage \
+          modules
+
+        echo "Installing modules into temporary package root..."
+
+        rm -rf "${OUTPUT_DIR}/modules"
+        mkdir -p "${OUTPUT_DIR}/modules"
+
+        sudo make \
+          modules_install \
+          INSTALL_MOD_PATH="${OUTPUT_DIR}/modules"
+
+        echo "Collecting kernel image..."
+
+        cp \
+          "arch/x86/boot/bzImage" \
+          "${OUTPUT_DIR}/vmlinuz-${KERNEL_VERSION}${LOCALVERSION}"
+
+        if [[ -f "System.map" ]]; then
+          cp \
+            "System.map" \
+            "${OUTPUT_DIR}/System.map-${KERNEL_VERSION}${LOCALVERSION}"
+        fi
+
+        if [[ -f ".config" ]]; then
+          cp \
+            ".config" \
+            "${OUTPUT_DIR}/config-${KERNEL_VERSION}${LOCALVERSION}"
+        fi
+
+        echo "Generating kernel metadata..."
+
+        {
+          echo "auraOS kernel"
+          echo "Kernel version: ${KERNEL_VERSION}"
+          echo "Kernel release: ${KERNEL_VERSION}${LOCALVERSION}"
+          echo "Build identity: ${KBUILD_BUILD_USER}@${KBUILD_BUILD_HOST}"
+          echo "Build version: ${KBUILD_BUILD_VERSION}"
+          echo "Architecture: $(uname -m)"
+          echo "Kernel config: ${{ inputs.kernel-config }}"
+          echo "Source package: 6.8.0-138.138"
+        } > "${OUTPUT_DIR}/auraOS-kernel-info.txt"
+
+        echo
+        echo "Built kernel:"
+        ls -lh "${OUTPUT_DIR}/vmlinuz-"*
+
+        echo
+        echo "Kernel release reported by make:"
+        make -s kernelrelease
+
+    - name: Build initramfs and Debian kernel package
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        KERNEL_VERSION="${{ inputs.kernel-version }}"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${KERNEL_VERSION}"
+        OUTPUT_DIR="${BUILD_ROOT}/output"
+        RELEASE="${KERNEL_VERSION}${{ inputs.kernel-localversion }}"
+
+        cd "${SOURCE_DIR}"
+
+        echo "Building initramfs..."
+
+        KERNEL_IMAGE="${OUTPUT_DIR}/vmlinuz-${RELEASE}"
+
+        if command -v mkinitramfs >/dev/null 2>&1; then
+          mkinitramfs \
+            -o "${OUTPUT_DIR}/initrd.img-${RELEASE}" \
+            "${RELEASE}" || true
+        fi
+
+        echo "Creating release directory..."
+
+        mkdir -p "${OUTPUT_DIR}/boot"
+
+        cp \
+          "${KERNEL_IMAGE}" \
+          "${OUTPUT_DIR}/boot/"
+
+        if [[ -f "${OUTPUT_DIR}/System.map-${RELEASE}" ]]; then
+          cp \
+            "${OUTPUT_DIR}/System.map-${RELEASE}" \
+            "${OUTPUT_DIR}/boot/"
+        fi
+
+        if [[ -f "${OUTPUT_DIR}/config-${RELEASE}" ]]; then
+          cp \
+            "${OUTPUT_DIR}/config-${RELEASE}" \
+            "${OUTPUT_DIR}/boot/"
+        fi
+
+        echo
+        echo "Output tree:"
+        find "${OUTPUT_DIR}" -maxdepth 3 -type f -printf '%p %k KB\n' | sort
+
+    - name: Create auraOS kernel archive
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        OUTPUT_DIR="${BUILD_ROOT}/output"
+        RELEASE="${{ inputs.kernel-version }}${{ inputs.kernel-localversion }}"
+
+        cd "${BUILD_ROOT}"
+
+        tar \
+          -czf \
+          "auraOS-kernel-${RELEASE}-x86_64.tar.gz" \
+          output
+
+        sha256sum \
+          "auraOS-kernel-${RELEASE}-x86_64.tar.gz" \
+          > "auraOS-kernel-${RELEASE}-x86_64.tar.gz.sha256"
+
+        echo "Kernel archive:"
+        ls -lh \
+          "auraOS-kernel-${RELEASE}-x86_64.tar.gz" \
+          "auraOS-kernel-${RELEASE}-x86_64.tar.gz.sha256"
+
+    - name: Upload auraOS kernel
+      uses: actions/upload-artifact@v4
+      with:
+        name: auraOS-linux-6.8.0-138-generic
+        path: |
+          ${{ github.workspace }}/auraOS-kernel/auraOS-kernel-6.8.0-138-generic-auraOS-x86_64.tar.gz
+          ${{ github.workspace }}/auraOS-kernel/auraOS-kernel-6.8.0-138-generic-auraOS-x86_64.tar.gz.sha256
+        if-no-files-found: error
+        compression-level: 0
+        retention-days: 30
+
+    - name: Disk space report after modification
+      shell: bash
+      run: |
+        echo "Memory and swap:"
+        sudo free -h
+        echo
+        sudo swapon --show
+        echo
+
+        echo "Available storage:"
+        sudo df -h
+        echo
+
+        echo "auraOS kernel build completed."
