@@ -576,45 +576,45 @@ runs:
         DIRECT_FILE="${OUTPUT_DIR}/page-extension-direct-selectors.txt"
 
         python3 - "${SOURCE_DIR}" "${GRAPH_FILE}" "${DIRECT_FILE}" <<'PY'
-          import pathlib
-          import re
-          import sys
-          
-          source = pathlib.Path(sys.argv[1])
-          graph_out = pathlib.Path(sys.argv[2])
-          direct_out = pathlib.Path(sys.argv[3])
-          
-          config_re = re.compile(r'^\s*(?:menuconfig|config)\s+([A-Za-z0-9_]+)\b')
-          select_re = re.compile(r'^\s*select\s+([A-Za-z0-9_]+)\b')
-          
-          edges = set()
-          for path in source.rglob('Kconfig*'):
-              if not path.is_file() or path.is_symlink():
-                  continue
-              try:
-                  lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
-              except OSError:
-                  continue
-              current = None
-              for line in lines:
-                  match = config_re.match(line)
-                  if match:
-                      current = match.group(1)
-                      continue
-                  match = select_re.match(line)
-                  if match and current:
-                      target = match.group(1)
-                      edges.add((target, current))
-          
-          with graph_out.open('w', encoding='utf-8') as f:
-              for target, selector in sorted(edges):
-                  f.write(f'{target}\t{selector}\n')
-          
-          with direct_out.open('w', encoding='utf-8') as f:
-              for target, selector in sorted(edges):
-                  if target == 'PAGE_EXTENSION':
-                      f.write(f'{selector}\n')
-        PY
+import pathlib
+import re
+import sys
+
+source = pathlib.Path(sys.argv[1])
+graph_out = pathlib.Path(sys.argv[2])
+direct_out = pathlib.Path(sys.argv[3])
+
+config_re = re.compile(r'^\s*(?:menuconfig|config)\s+([A-Za-z0-9_]+)\b')
+select_re = re.compile(r'^\s*select\s+([A-Za-z0-9_]+)\b')
+
+edges = set()
+for path in source.rglob('Kconfig*'):
+    if not path.is_file() or path.is_symlink():
+        continue
+    try:
+        lines = path.read_text(encoding='utf-8', errors='ignore').splitlines()
+    except OSError:
+        continue
+    current = None
+    for line in lines:
+        match = config_re.match(line)
+        if match:
+            current = match.group(1)
+            continue
+        match = select_re.match(line)
+        if match and current:
+            target = match.group(1)
+            edges.add((target, current))
+
+with graph_out.open('w', encoding='utf-8') as f:
+    for target, selector in sorted(edges):
+        f.write(f'{target}\t{selector}\n')
+
+with direct_out.open('w', encoding='utf-8') as f:
+    for target, selector in sorted(edges):
+        if target == 'PAGE_EXTENSION':
+            f.write(f'{selector}\n')
+PY
 
         echo
         echo "Symbols that directly select PAGE_EXTENSION:"
