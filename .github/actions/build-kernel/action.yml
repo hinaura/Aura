@@ -520,6 +520,8 @@ runs:
           --disable CONFIG_UBSAN_TRAP \
           --disable CONFIG_DEBUG_OBJECTS \
           --disable CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS \
+          --set-val CONFIG_DRM_KMS_HELPER m \
+          --set-val CONFIG_DRM_FBDEV_EMULATION m \
           --disable CONFIG_DEBUG_LIST \
           --disable CONFIG_DEBUG_SG \
           --disable CONFIG_DEBUG_NOTIFIERS \
@@ -734,6 +736,11 @@ runs:
         OUTPUT_DIR="${BUILD_ROOT}/build"
         test -f "${OUTPUT_DIR}/.config"
         cd "${SOURCE_DIR}"
+        echo "Re-asserting DRM built-in/module consistency after the PAGE_EXTENSION fixpoint loop..."
+        "${SOURCE_DIR}/scripts/config" --file "${OUTPUT_DIR}/.config" \
+          --set-val CONFIG_DRM_KMS_HELPER m \
+          --set-val CONFIG_DRM_FBDEV_EMULATION m
+        make O="${OUTPUT_DIR}" olddefconfig
         REQUIRED_Y=(CONFIG_MODULES CONFIG_X86_64 CONFIG_X86 CONFIG_64BIT CONFIG_KALLSYMS CONFIG_IA32_EMULATION)
         for cfg in "${REQUIRED_Y[@]}"; do
           if ! grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config"; then
