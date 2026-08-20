@@ -439,7 +439,7 @@ runs:
         CONFIG_SATA_AHCI=m
         CONFIG_MD=m
         CONFIG_DM_CRYPT=m
-        CONFIG_DRM=y
+        CONFIG_DRM=m
         CONFIG_SOUND=m
         CONFIG_HID=m
         CONFIG_USB=m
@@ -519,7 +519,6 @@ runs:
           --disable CONFIG_UBSAN \
           --disable CONFIG_UBSAN_TRAP \
           --disable CONFIG_DEBUG_OBJECTS \
-          --set-val CONFIG_DRM y \
           --disable CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS \
           --disable CONFIG_DEBUG_LIST \
           --disable CONFIG_DEBUG_SG \
@@ -752,6 +751,22 @@ runs:
         echo
         echo "Critical configuration:"
         grep -E '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DRM|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_UBSAN|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" || true
+        echo
+        echo "Checking DRM built-in/module consistency..."
+        # If the DRM core is built as a module, nothing that links symbols
+        # from drm.ko may be built statically into vmlinux, or the final
+        # link fails with hundreds of "undefined reference to drm_*" errors
+        # after the full ~20 minute compile. Catch it here instead.
+        if grep -q '^CONFIG_DRM=m$' "${OUTPUT_DIR}/.config"; then
+          for cfg in CONFIG_DRM_KMS_HELPER CONFIG_DRM_FBDEV_EMULATION; do
+            if grep -q "^${cfg}=y\$" "${OUTPUT_DIR}/.config"; then
+              echo "ERROR: CONFIG_DRM=m but ${cfg}=y (built-in code would reference drm.ko symbols)."
+              echo "Either force CONFIG_DRM=y as well, or force ${cfg}=m to match."
+              exit 1
+            fi
+          done
+        fi
+        echo "DRM built-in/module state is consistent."
         echo
         echo "Configuration counts:"
         printf '  Built-in: '; grep -Ec '^CONFIG_[A-Za-z0-9_]+=y$' "${OUTPUT_DIR}/.config" || true
