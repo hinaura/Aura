@@ -114,7 +114,7 @@ inputs:
     default: 'allmodconfig'
 
   kernel-jobs:
-    description: 'Number of parallel kernel build jobs. Defaults to nproc - 1.'
+    description: 'Number of parallel kernel build jobs. Defaults to a conservative value based on nproc.'
     required: false
     default: ''
 
@@ -151,7 +151,7 @@ runs:
         echo "${ARCH}"
 
         if [[ "${ARCH}" != "x86_64" ]]; then
-          echo "ERROR: This action currently produces x86_64 artifacts."
+          echo "ERROR: This action produces x86_64 artifacts."
           exit 1
         fi
 
@@ -223,16 +223,11 @@ runs:
           exit 1
         fi
 
-        if (( SWAP_SIZE_MB < 1024 )); then
-          echo "ERROR: swap-size-mb should be at least 1024 MiB."
-          exit 1
-        fi
-
-        echo "Build mount:   ${BUILD_MOUNT_PATH}"
-        echo "Mount owner:   ${ACTUAL_OWNER}"
-        echo "Root reserve:  ${ROOT_RESERVE_MB} MiB"
-        echo "Temp reserve:  ${TEMP_RESERVE_MB} MiB"
-        echo "Swap:          ${SWAP_SIZE_MB} MiB"
+        echo "Build mount:  ${BUILD_MOUNT_PATH}"
+        echo "Mount owner:  ${ACTUAL_OWNER}"
+        echo "Root reserve: ${ROOT_RESERVE_MB} MiB"
+        echo "Temp reserve: ${TEMP_RESERVE_MB} MiB"
+        echo "Swap:         ${SWAP_SIZE_MB} MiB"
 
         echo
         echo "Removing unnecessary preinstalled software..."
@@ -253,8 +248,7 @@ runs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
         fi
 
-        if [[ "${{ inputs.remove-docker-images }}" == "true" ]] &&
-           command -v docker >/dev/null 2>&1; then
+        if [[ "${{ inputs.remove-docker-images }}" == "true" ]] && command -v docker >/dev/null 2>&1; then
           sudo docker system prune -af --volumes || true
         fi
 
@@ -270,29 +264,6 @@ runs:
         VG_NAME="buildvg"
         ROOT_LOOP_DEV=""
         TMP_LOOP_DEV=""
-
-        cleanup_lvm() {
-          set +e
-
-          echo
-          echo "LVM cleanup..."
-
-          if [[ -n "${VG_NAME}" ]]; then
-            sudo umount "${BUILD_MOUNT_PATH}" 2>/dev/null || true
-            sudo lvremove -fy "${VG_NAME}" 2>/dev/null || true
-            sudo vgremove -fy "${VG_NAME}" 2>/dev/null || true
-          fi
-
-          if [[ -n "${ROOT_LOOP_DEV}" ]]; then
-            sudo losetup -d "${ROOT_LOOP_DEV}" 2>/dev/null || true
-          fi
-
-          if [[ -n "${TMP_LOOP_DEV}" ]]; then
-            sudo losetup -d "${TMP_LOOP_DEV}" 2>/dev/null || true
-          fi
-        }
-
-        trap cleanup_lvm EXIT
 
         sudo mkdir -p "${BUILD_MOUNT_PATH}"
 
@@ -314,7 +285,6 @@ runs:
         if (( ROOT_FREE_KB <= ROOT_RESERVE_KB + MIN_LVM_KB )); then
           echo "WARNING: insufficient root free space for an LVM build volume."
           echo "Continuing with the original workspace filesystem."
-          trap - EXIT
           exit 0
         fi
 
@@ -329,28 +299,18 @@ runs:
         sudo touch "${{ inputs.pv-loop-path }}"
 
         if [[ "${{ inputs.overprovision-lvm }}" == "true" ]]; then
-          sudo truncate \
-            -s "${ROOT_LVM_SIZE_BYTES}" \
-            "${{ inputs.pv-loop-path }}"
+          sudo truncate -s "${ROOT_LVM_SIZE_BYTES}" "${{ inputs.pv-loop-path }}"
         else
-          sudo fallocate \
-            -l "${ROOT_LVM_SIZE_BYTES}" \
-            "${{ inputs.pv-loop-path }}"
+          sudo fallocate -l "${ROOT_LVM_SIZE_BYTES}" "${{ inputs.pv-loop-path }}"
         fi
 
         ROOT_LOOP_DEV="$(
-          sudo losetup \
-            --find \
-            --show \
-            "${{ inputs.pv-loop-path }}"
+          sudo losetup --find --show "${{ inputs.pv-loop-path }}"
         )"
 
         echo "Root loop device: ${ROOT_LOOP_DEV}"
 
-        sudo pvcreate \
-          -ff \
-          -y \
-          "${ROOT_LOOP_DEV}"
+        sudo pvcreate -ff -y "${ROOT_LOOP_DEV}"
 
         PV_DEVICES=("${ROOT_LOOP_DEV}")
 
@@ -371,36 +331,23 @@ runs:
             echo "Temp free before LVM: ${TMP_FREE_KB} KiB"
             echo "Temp LVM size:       ${TMP_LVM_SIZE_KB} KiB"
 
-            sudo mkdir -p \
-              "$(dirname "${{ inputs.tmp-pv-loop-path }}")"
-
+            sudo mkdir -p "$(dirname "${{ inputs.tmp-pv-loop-path }}")"
             sudo rm -f "${{ inputs.tmp-pv-loop-path }}"
             sudo touch "${{ inputs.tmp-pv-loop-path }}"
 
             if [[ "${{ inputs.overprovision-lvm }}" == "true" ]]; then
-              sudo truncate \
-                -s "${TMP_LVM_SIZE_BYTES}" \
-                "${{ inputs.tmp-pv-loop-path }}"
+              sudo truncate -s "${TMP_LVM_SIZE_BYTES}" "${{ inputs.tmp-pv-loop-path }}"
             else
-              sudo fallocate \
-                -l "${TMP_LVM_SIZE_BYTES}" \
-                "${{ inputs.tmp-pv-loop-path }}"
+              sudo fallocate -l "${TMP_LVM_SIZE_BYTES}" "${{ inputs.tmp-pv-loop-path }}"
             fi
 
             TMP_LOOP_DEV="$(
-              sudo losetup \
-                --find \
-                --show \
-                "${{ inputs.tmp-pv-loop-path }}"
+              sudo losetup --find --show "${{ inputs.tmp-pv-loop-path }}"
             )"
 
             echo "Temp loop device: ${TMP_LOOP_DEV}"
 
-            sudo pvcreate \
-              -ff \
-              -y \
-              "${TMP_LOOP_DEV}"
-
+            sudo pvcreate -ff -y "${TMP_LOOP_DEV}"
             PV_DEVICES+=("${TMP_LOOP_DEV}")
           else
             echo "Not enough free space on /mnt; using root PV only."
@@ -412,50 +359,27 @@ runs:
         echo
         echo "Creating volume group..."
 
-        sudo vgcreate \
-          "${VG_NAME}" \
-          "${PV_DEVICES[@]}"
+        sudo vgcreate "${VG_NAME}" "${PV_DEVICES[@]}"
 
         echo
         echo "Creating swap LV..."
 
-        sudo lvcreate \
-          -L "${SWAP_SIZE_MB}M" \
-          -n swap \
-          "${VG_NAME}"
-
-        sudo mkswap \
-          "/dev/${VG_NAME}/swap"
-
-        sudo swapon \
-          "/dev/${VG_NAME}/swap"
+        sudo lvcreate -L "${SWAP_SIZE_MB}M" -n swap "${VG_NAME}"
+        sudo mkswap "/dev/${VG_NAME}/swap"
+        sudo swapon "/dev/${VG_NAME}/swap"
 
         echo
         echo "Creating build LV..."
 
-        if ! sudo lvcreate \
-          -l 100%FREE \
-          -n buildlv \
-          "${VG_NAME}"; then
-          echo "ERROR: Failed to create build LV."
-          sudo vgdisplay "${VG_NAME}" || true
-          exit 1
-        fi
+        sudo lvcreate -l 100%FREE -n buildlv "${VG_NAME}"
 
         sudo mkfs.ext4 \
           -m 0 \
           -E lazy_itable_init=1,lazy_journal_init=1 \
           "/dev/${VG_NAME}/buildlv"
 
-        sudo mount \
-          "/dev/${VG_NAME}/buildlv" \
-          "${BUILD_MOUNT_PATH}"
-
-        sudo chown \
-          "${ACTUAL_OWNER}" \
-          "${BUILD_MOUNT_PATH}"
-
-        trap - EXIT
+        sudo mount "/dev/${VG_NAME}/buildlv" "${BUILD_MOUNT_PATH}"
+        sudo chown "${ACTUAL_OWNER}" "${BUILD_MOUNT_PATH}"
 
         echo
         echo "Build filesystem:"
@@ -523,7 +447,6 @@ runs:
           e2fsprogs \
           file \
           tar \
-          gzip \
           perl \
           python3 \
           python3-minimal
@@ -542,24 +465,13 @@ runs:
 
         printf 'int main(void) { return 0; }\n' > /tmp/aura-test.c
 
-        gcc \
-          -m32 \
-          /tmp/aura-test.c \
-          -o /tmp/aura-test32
+        gcc -m32 /tmp/aura-test.c -o /tmp/aura-test32
+        gcc -m64 /tmp/aura-test.c -o /tmp/aura-test64
 
         file /tmp/aura-test32
-
-        gcc \
-          -m64 \
-          /tmp/aura-test.c \
-          -o /tmp/aura-test64
-
         file /tmp/aura-test64
 
-        rm -f \
-          /tmp/aura-test.c \
-          /tmp/aura-test32 \
-          /tmp/aura-test64
+        rm -f /tmp/aura-test.c /tmp/aura-test32 /tmp/aura-test64
 
         echo
         echo "Required binaries:"
@@ -587,20 +499,17 @@ runs:
           zstd \
           lz4 \
           python3; do
-
           if ! command -v "${tool}" >/dev/null 2>&1; then
             echo "ERROR: Required tool not found: ${tool}"
             exit 1
           fi
         done
 
-        echo
-        echo "Required headers/libraries check:"
-
         test -f /usr/include/openssl/ssl.h
         test -f /usr/include/elf.h
         test -f /usr/include/ncurses.h
 
+        echo
         echo "Build dependencies check passed."
 
     - name: Download Ubuntu Linux source
@@ -642,18 +551,13 @@ runs:
             -o "${SOURCE_DEB}.part" \
             "${url}"; then
 
-            if [[ ! -s "${SOURCE_DEB}.part" ]]; then
-              echo "Downloaded file is empty."
-              rm -f "${SOURCE_DEB}.part"
-              continue
+            if [[ -s "${SOURCE_DEB}.part" ]]; then
+              mv "${SOURCE_DEB}.part" "${SOURCE_DEB}"
+              downloaded="true"
+              break
             fi
 
-            mv \
-              "${SOURCE_DEB}.part" \
-              "${SOURCE_DEB}"
-
-            downloaded="true"
-            break
+            rm -f "${SOURCE_DEB}.part"
           fi
         done
 
@@ -670,20 +574,15 @@ runs:
         echo
         echo "Checking Debian package:"
 
-        dpkg-deb \
-          --info \
-          "${SOURCE_DEB}" |
-          head -100
+        dpkg-deb --info "${SOURCE_DEB}" | head -100
 
         echo
-        echo "Checking package contents..."
+        echo "Checking package contents:"
 
-        dpkg-deb \
-          --contents \
-          "${SOURCE_DEB}" |
-          grep -E \
-            'linux-source-6\.8\.0\.tar\.(bz2|xz|zst)$' |
-          head -20
+        if ! dpkg-deb --contents "${SOURCE_DEB}" | grep -E 'linux-source-6\.8\.0\.tar\.(bz2|xz|zst)$' | head -20; then
+          echo "ERROR: Expected Linux 6.8 source archive was not found in the package."
+          exit 1
+        fi
 
         echo
         echo "Extracting source package..."
@@ -715,36 +614,20 @@ runs:
         if [[ -z "${SOURCE_TARBALL}" ]]; then
           echo "ERROR: Kernel source archive not found."
 
-          find "${BUILD_ROOT}/source-package" \
-            -type f |
-            head -100
+          find "${BUILD_ROOT}/source-package" -type f | head -100
 
           exit 1
         fi
 
-        echo
-        echo "Source archive:"
-        echo "  ${SOURCE_TARBALL}"
-
         case "${SOURCE_TARBALL}" in
           *.tar.bz2)
-            tar \
-              -xjf "${SOURCE_TARBALL}" \
-              --strip-components=1 \
-              -C "${SOURCE_DIR}"
+            tar -xjf "${SOURCE_TARBALL}" --strip-components=1 -C "${SOURCE_DIR}"
             ;;
           *.tar.xz)
-            tar \
-              -xJf "${SOURCE_TARBALL}" \
-              --strip-components=1 \
-              -C "${SOURCE_DIR}"
+            tar -xJf "${SOURCE_TARBALL}" --strip-components=1 -C "${SOURCE_DIR}"
             ;;
           *.tar.zst)
-            tar \
-              --zstd \
-              -xf "${SOURCE_TARBALL}" \
-              --strip-components=1 \
-              -C "${SOURCE_DIR}"
+            tar --zstd -xf "${SOURCE_TARBALL}" --strip-components=1 -C "${SOURCE_DIR}"
             ;;
           *)
             echo "ERROR: Unsupported archive: ${SOURCE_TARBALL}"
@@ -763,21 +646,12 @@ runs:
         echo "  ${SOURCE_DIR}"
 
         echo
-        echo "Kernel Makefile:"
-        head -n 12 "${SOURCE_DIR}/Makefile"
-
-        echo
         echo "Kernel version reported by source:"
 
-        make \
-          -C "${SOURCE_DIR}" \
-          kernelversion
+        make -C "${SOURCE_DIR}" kernelversion
 
         ACTUAL_BASE_VERSION="$(
-          make \
-            -C "${SOURCE_DIR}" \
-            -s \
-            kernelversion
+          make -C "${SOURCE_DIR}" -s kernelversion
         )"
 
         case "${ACTUAL_BASE_VERSION}" in
@@ -790,16 +664,7 @@ runs:
             ;;
         esac
 
-        echo
-        echo "Driver directories:"
-
-        find "${SOURCE_DIR}/drivers" \
-          -mindepth 1 \
-          -maxdepth 1 \
-          -type d |
-          wc -l
-
-    - name: Apply Ubuntu 6.8 build compatibility checks
+    - name: Check known Ubuntu AppArmor build issue
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
@@ -810,30 +675,22 @@ runs:
 
         cd "${SOURCE_DIR}"
 
-        echo "Checking AppArmor source for known problematic symbols..."
+        echo "Checking AppArmor source for the known incompatible symbol..."
 
         if grep -R \
-             -n \
-             --include='*.c' \
-             --include='*.h' \
-             'spin_is_lock' \
-             security/apparmor 2>/dev/null; then
+          -n \
+          --include='*.c' \
+          'spin_is_lock' \
+          security/apparmor 2>/dev/null; then
 
           echo
-          echo "Detected AppArmor spin_is_lock usage."
-          echo "CONFIG_SECURITY_APPARMOR will be disabled."
+          echo "AppArmor contains spin_is_lock()."
+          echo "CONFIG_SECURITY_APPARMOR will be forced to n."
         fi
 
         echo
-        echo "Checking RCU list API:"
-
-        grep -n \
-          'list_for_each_entry_rcu' \
-          include/linux/rculist.h |
-          head -5 || true
-
-        echo
-        echo "RCU API check completed."
+        echo "RCU list API references:"
+        grep -n 'list_for_each_entry_rcu' include/linux/rculist.h | head -10 || true
 
     - name: Configure auraOS kernel
       shell: bash
@@ -851,156 +708,119 @@ runs:
         cd "${SOURCE_DIR}"
 
         echo "Cleaning source tree..."
-
         make mrproper
 
         CONFIG_EXTRA="${OUTPUT_DIR}/auraOS-extra.config"
 
         cat > "${CONFIG_EXTRA}" <<'EOF'
-CONFIG_MODULES=y
-CONFIG_KALLSYMS=y
-CONFIG_KALLSYMS_ALL=y
-CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
-
-# ------------------------------------------------------------------
-# x86_64 / compatibility
-# ------------------------------------------------------------------
-
-CONFIG_64BIT=y
-CONFIG_X86=y
-CONFIG_X86_64=y
-CONFIG_IA32_EMULATION=y
-
-# ------------------------------------------------------------------
-# Broad hardware / kernel capabilities
-# ------------------------------------------------------------------
-
-CONFIG_PCI=y
-CONFIG_PCIEPORTBUS=y
-CONFIG_SCSI=m
-CONFIG_ATA=m
-CONFIG_SATA_AHCI=m
-CONFIG_MD=m
-CONFIG_DM_CRYPT=m
-CONFIG_DRM=m
-CONFIG_SOUND=m
-CONFIG_HID=m
-CONFIG_USB=m
-CONFIG_USB_SUPPORT=y
-CONFIG_NET=y
-CONFIG_INET=y
-CONFIG_IPV6=y
-CONFIG_WLAN=m
-CONFIG_BT=m
-CONFIG_INPUT=m
-CONFIG_I2C=m
-CONFIG_SPI=m
-CONFIG_PNP=y
-CONFIG_ACPI=y
-CONFIG_HWMON=m
-CONFIG_RTC_CLASS=m
-CONFIG_MTD=m
-CONFIG_NVMEM=m
-CONFIG_FW_LOADER=y
-CONFIG_DEVTMPFS=y
-CONFIG_DEVTMPFS_MOUNT=y
-CONFIG_TMPFS=y
-
-# ------------------------------------------------------------------
-# Disable known problematic / unnecessary subsystems for this build
-# ------------------------------------------------------------------
-
-CONFIG_SECURITY_APPARMOR=n
-CONFIG_SECURITY_TOMOYO=n
-CONFIG_SECURITY_SMACK=n
-CONFIG_SECURITY_LOADPIN=n
-CONFIG_SECURITY_LANDLOCK=n
-CONFIG_SECURITY_IPE=n
-CONFIG_SECURITY_SAFESETID=n
-CONFIG_SECURITY_YAMA=n
-CONFIG_SECURITY_LOCKDOWN_LSM=n
-CONFIG_BPF_LSM=n
-
-# ------------------------------------------------------------------
-# Toolchain-sensitive features
-# ------------------------------------------------------------------
-
-CONFIG_RUST=n
-CONFIG_GCC_PLUGINS=n
-CONFIG_WERROR=n
-CONFIG_UAPI_HEADER_TEST=n
-
-# ------------------------------------------------------------------
-# Debug / instrumentation reduced for CI stability
-# ------------------------------------------------------------------
-
-CONFIG_DEBUG_INFO_BTF=n
-CONFIG_DEBUG_INFO_BTF_MODULES=n
-CONFIG_KASAN=n
-CONFIG_KCSAN=n
-CONFIG_KFENCE=n
-CONFIG_KCOV=n
-CONFIG_UBSAN=n
-CONFIG_UBSAN_TRAP=n
-CONFIG_DEBUG_OBJECTS=n
-CONFIG_DEBUG_LIST=n
-CONFIG_DEBUG_SG=n
-CONFIG_DEBUG_NOTIFIERS=n
-CONFIG_DEBUG_KMEMLEAK=n
-CONFIG_DEBUG_PAGEALLOC=n
-CONFIG_PAGE_POISONING=n
-CONFIG_PAGE_EXTENSION=n
-CONFIG_SLUB_DEBUG=n
-CONFIG_SLAB_FREELIST_HARDENED=n
-CONFIG_SLAB_FREELIST_RANDOM=n
-CONFIG_SHUFFLE_PAGE_ALLOCATOR=n
-
-# ------------------------------------------------------------------
-# Local version
-# ------------------------------------------------------------------
-
-CONFIG_LOCALVERSION_AUTO=n
-EOF
+        CONFIG_MODULES=y
+        CONFIG_KALLSYMS=y
+        CONFIG_KALLSYMS_ALL=y
+        CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+        
+        # x86_64 target
+        CONFIG_64BIT=y
+        CONFIG_X86=y
+        CONFIG_X86_64=y
+        CONFIG_IA32_EMULATION=y
+        
+        # Broad hardware support
+        CONFIG_PCI=y
+        CONFIG_PCIEPORTBUS=y
+        CONFIG_SCSI=m
+        CONFIG_ATA=m
+        CONFIG_SATA_AHCI=m
+        CONFIG_MD=m
+        CONFIG_DM_CRYPT=m
+        CONFIG_DRM=m
+        CONFIG_SOUND=m
+        CONFIG_HID=m
+        CONFIG_USB=m
+        CONFIG_USB_SUPPORT=y
+        CONFIG_NET=y
+        CONFIG_INET=y
+        CONFIG_IPV6=y
+        CONFIG_WLAN=m
+        CONFIG_BT=m
+        CONFIG_INPUT=m
+        CONFIG_I2C=m
+        CONFIG_SPI=m
+        CONFIG_PNP=y
+        CONFIG_ACPI=y
+        CONFIG_HWMON=m
+        CONFIG_RTC_CLASS=m
+        CONFIG_MTD=m
+        CONFIG_NVMEM=m
+        CONFIG_FW_LOADER=y
+        CONFIG_DEVTMPFS=y
+        CONFIG_DEVTMPFS_MOUNT=y
+        CONFIG_TMPFS=y
+        
+        # Known problematic Ubuntu AppArmor compilation path
+        CONFIG_SECURITY_APPARMOR=n
+        
+        # Toolchain-sensitive options
+        CONFIG_RUST=n
+        CONFIG_GCC_PLUGINS=n
+        CONFIG_WERROR=n
+        CONFIG_UAPI_HEADER_TEST=n
+        
+        # BTF is disabled for stable CI compilation
+        CONFIG_DEBUG_INFO_BTF=n
+        CONFIG_DEBUG_INFO_BTF_MODULES=n
+        
+        # Expensive sanitizers/debug instrumentation are not needed for the release build
+        CONFIG_KASAN=n
+        CONFIG_KCSAN=n
+        CONFIG_KFENCE=n
+        CONFIG_KCOV=n
+        CONFIG_UBSAN=n
+        CONFIG_UBSAN_TRAP=n
+        CONFIG_DEBUG_OBJECTS=n
+        CONFIG_DEBUG_LIST=n
+        CONFIG_DEBUG_SG=n
+        CONFIG_DEBUG_NOTIFIERS=n
+        CONFIG_DEBUG_KMEMLEAK=n
+        CONFIG_DEBUG_PAGEALLOC=n
+        CONFIG_PAGE_POISONING=n
+        CONFIG_PAGE_EXTENSION=n
+        CONFIG_SLUB_DEBUG=n
+        CONFIG_SLAB_FREELIST_HARDENED=n
+        CONFIG_SLAB_FREELIST_RANDOM=n
+        CONFIG_SHUFFLE_PAGE_ALLOCATOR=n
+        
+        # Reproducible local version
+        CONFIG_LOCALVERSION_AUTO=n
+        EOF
 
         export KCONFIG_CONFIG="${OUTPUT_DIR}/.config"
         export KCONFIG_ALLCONFIG="${CONFIG_EXTRA}"
 
-        echo
-        echo "Generating base kernel configuration..."
-
         case "${{ inputs.kernel-config }}" in
           allmodconfig)
-            make \
-              O="${OUTPUT_DIR}" \
-              allmodconfig
+            make O="${OUTPUT_DIR}" allmodconfig
             ;;
           allyesconfig)
-            make \
-              O="${OUTPUT_DIR}" \
-              allyesconfig
+            make O="${OUTPUT_DIR}" allyesconfig
             ;;
           allnoconfig)
-            make \
-              O="${OUTPUT_DIR}" \
-              allnoconfig
+            make O="${OUTPUT_DIR}" allnoconfig
             ;;
           *)
-            echo "Unknown kernel-config: ${{ inputs.kernel-config }}"
+            echo "ERROR: Unknown kernel-config: ${{ inputs.kernel-config }}"
             exit 1
             ;;
         esac
 
         echo
-        echo "Applying auraOS configuration constraints..."
+        echo "Resolving Kconfig dependencies..."
 
-        make \
-          O="${OUTPUT_DIR}" \
-          olddefconfig
+        make O="${OUTPUT_DIR}" olddefconfig
 
         unset KCONFIG_ALLCONFIG
 
         echo
-        echo "Applying explicit configuration overrides..."
+        echo "Applying explicit auraOS configuration overrides..."
 
         "${SOURCE_DIR}/scripts/config" \
           --file "${OUTPUT_DIR}/.config" \
@@ -1011,15 +831,6 @@ EOF
           --disable CONFIG_DEBUG_INFO_BTF_MODULES \
           --disable CONFIG_UAPI_HEADER_TEST \
           --disable CONFIG_SECURITY_APPARMOR \
-          --disable CONFIG_SECURITY_TOMOYO \
-          --disable CONFIG_SECURITY_SMACK \
-          --disable CONFIG_SECURITY_LOADPIN \
-          --disable CONFIG_SECURITY_LANDLOCK \
-          --disable CONFIG_SECURITY_IPE \
-          --disable CONFIG_SECURITY_SAFESETID \
-          --disable CONFIG_SECURITY_YAMA \
-          --disable CONFIG_SECURITY_LOCKDOWN_LSM \
-          --disable CONFIG_BPF_LSM \
           --disable CONFIG_KASAN \
           --disable CONFIG_KCSAN \
           --disable CONFIG_KFENCE \
@@ -1048,42 +859,29 @@ EOF
           --disable CONFIG_LOCALVERSION_AUTO \
           --set-str CONFIG_LOCALVERSION "${{ inputs.kernel-localversion }}"
 
-        echo
-        echo "Re-resolving Kconfig dependencies..."
-
-        make \
-          O="${OUTPUT_DIR}" \
-          olddefconfig
+        make O="${OUTPUT_DIR}" olddefconfig
 
         echo
-        echo "Running configuration sanity checks..."
+        echo "Checking final configuration..."
 
-        required_y=(
+        REQUIRED_Y=(
           CONFIG_MODULES
           CONFIG_X86_64
           CONFIG_X86
           CONFIG_64BIT
           CONFIG_KALLSYMS
+          CONFIG_IA32_EMULATION
         )
 
-        for cfg in "${required_y[@]}"; do
+        for cfg in "${REQUIRED_Y[@]}"; do
           if ! grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config"; then
-            echo "ERROR: ${cfg} must be enabled as y."
+            echo "ERROR: ${cfg} is not enabled."
             exit 1
           fi
         done
 
-        disabled_configs=(
+        DISABLED=(
           CONFIG_SECURITY_APPARMOR
-          CONFIG_SECURITY_TOMOYO
-          CONFIG_SECURITY_SMACK
-          CONFIG_SECURITY_LOADPIN
-          CONFIG_SECURITY_LANDLOCK
-          CONFIG_SECURITY_IPE
-          CONFIG_SECURITY_SAFESETID
-          CONFIG_SECURITY_YAMA
-          CONFIG_SECURITY_LOCKDOWN_LSM
-          CONFIG_BPF_LSM
           CONFIG_UAPI_HEADER_TEST
           CONFIG_WERROR
           CONFIG_RUST
@@ -1110,64 +908,35 @@ EOF
           CONFIG_SHUFFLE_PAGE_ALLOCATOR
         )
 
-        for cfg in "${disabled_configs[@]}"; do
-          if grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config" ||
-             grep -q "^${cfg}=m$" "${OUTPUT_DIR}/.config"; then
+        for cfg in "${DISABLED[@]}"; do
+          if grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config" || grep -q "^${cfg}=m$" "${OUTPUT_DIR}/.config"; then
             echo "ERROR: ${cfg} must be disabled."
             exit 1
           fi
         done
 
-        if ! grep -q '^CONFIG_IA32_EMULATION=y$' \
-          "${OUTPUT_DIR}/.config"; then
-          echo "ERROR: CONFIG_IA32_EMULATION must be enabled."
-          exit 1
-        fi
-
         echo
-        echo "Selected configuration:"
+        echo "Critical configuration:"
 
         grep -E \
           '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_UBSAN)=' \
           "${OUTPUT_DIR}/.config" || true
 
         echo
-        echo "Security configuration:"
-
-        grep -E \
-          '^(CONFIG_SECURITY=|CONFIG_SECURITY_[A-Za-z0-9_]+=|CONFIG_LSM=)' \
-          "${OUTPUT_DIR}/.config" |
-          head -100 || true
-
-        echo
-        echo "Configuration statistics:"
+        echo "Configuration counts:"
 
         printf '  Built-in: '
-        grep -Ec '^CONFIG_[A-Za-z0-9_]+=y$' \
-          "${OUTPUT_DIR}/.config" || true
+        grep -Ec '^CONFIG_[A-Za-z0-9_]+=y$' "${OUTPUT_DIR}/.config" || true
 
         printf '  Modules:  '
-        grep -Ec '^CONFIG_[A-Za-z0-9_]+=m$' \
-          "${OUTPUT_DIR}/.config" || true
+        grep -Ec '^CONFIG_[A-Za-z0-9_]+=m$' "${OUTPUT_DIR}/.config" || true
 
         printf '  Disabled: '
-        grep -Ec '^# CONFIG_[A-Za-z0-9_]+ is not set$' \
-          "${OUTPUT_DIR}/.config" || true
+        grep -Ec '^# CONFIG_[A-Za-z0-9_]+ is not set$' "${OUTPUT_DIR}/.config" || true
 
         echo
-        echo "Checking generated config consistency..."
-
-        make \
-          O="${OUTPUT_DIR}" \
-          listnewconfig </dev/null || true
-
-        echo
-        echo "Final kernel release preview:"
-
-        make \
-          O="${OUTPUT_DIR}" \
-          -s \
-          kernelrelease
+        echo "Kernel release:"
+        make O="${OUTPUT_DIR}" -s kernelrelease
 
     - name: Pre-build resource check
       shell: bash
@@ -1175,6 +944,7 @@ EOF
         set -euo pipefail
 
         BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        OUTPUT_DIR="${BUILD_ROOT}/build"
 
         echo "=============================================="
         echo " Pre-build resource check"
@@ -1200,41 +970,15 @@ EOF
         echo "Build directory size:"
         du -sh \
           "${BUILD_ROOT}/linux-${{ inputs.kernel-version }}" \
-          "${BUILD_ROOT}/build" \
+          "${OUTPUT_DIR}" \
           2>/dev/null || true
 
         echo
-        echo "Available space on all filesystems:"
-        df -h
+        echo "Critical config:"
 
-        echo
-        echo "Kernel configuration file:"
-        ls -lh \
-          "${BUILD_ROOT}/build/.config"
-
-        echo
-        echo "Kernel config critical checks:"
-
-        for cfg in \
-          CONFIG_MODULES \
-          CONFIG_X86_64 \
-          CONFIG_X86 \
-          CONFIG_64BIT \
-          CONFIG_IA32_EMULATION; do
-
-          grep \
-            "^${cfg}=" \
-            "${BUILD_ROOT}/build/.config" ||
-            true
-        done
-
-        echo
-        echo "AppArmor:"
-        grep \
-          -E \
-          '^(CONFIG_SECURITY_APPARMOR|CONFIG_SECURITY=|CONFIG_LSM=)' \
-          "${BUILD_ROOT}/build/.config" ||
-          true
+        grep -E \
+          '^(CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR)=' \
+          "${OUTPUT_DIR}/.config" || true
 
     - name: Build auraOS kernel
       shell: bash
@@ -1266,18 +1010,16 @@ EOF
           fi
         else
           if (( CPU_COUNT > 4 )); then
-            JOBS="$((CPU_COUNT - 2))"
+            JOBS=$((CPU_COUNT - 2))
           elif (( CPU_COUNT > 2 )); then
-            JOBS="$((CPU_COUNT - 1))"
+            JOBS=$((CPU_COUNT - 1))
           else
             JOBS=1
           fi
         fi
 
         MAX_SAFE_JOBS=$((CPU_COUNT + 1))
-
         if (( JOBS > MAX_SAFE_JOBS )); then
-          echo "Requested jobs (${JOBS}) exceeds safe limit (${MAX_SAFE_JOBS})."
           JOBS="${MAX_SAFE_JOBS}"
         fi
 
@@ -1303,7 +1045,7 @@ EOF
 
         export MAKEFLAGS="-Otarget"
 
-        COMMON_MAKE_ARGS=(
+        COMMON_ARGS=(
           O="${OUTPUT_DIR}"
           KBUILD_BUILD_USER="${KBUILD_BUILD_USER}"
           KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}"
@@ -1315,29 +1057,17 @@ EOF
         echo
         echo "=== Stage 1/2: bzImage ==="
 
-        set +e
-
-        make \
-          "${COMMON_MAKE_ARGS[@]}" \
+        if ! make \
+          "${COMMON_ARGS[@]}" \
           -j"${JOBS}" \
           "${VERBOSE[@]}" \
-          bzImage
-
-        IMAGE_STATUS=$?
-
-        set -e
-
-        if (( IMAGE_STATUS != 0 )); then
-          echo
-          echo "=============================================="
-          echo " bzImage failed"
-          echo "=============================================="
+          bzImage; then
 
           echo
-          echo "Running retry with -j1 V=1."
+          echo "bzImage failed. Retrying with -j1 V=1..."
 
           make \
-            "${COMMON_MAKE_ARGS[@]}" \
+            "${COMMON_ARGS[@]}" \
             -j1 \
             V=1 \
             bzImage
@@ -1348,29 +1078,17 @@ EOF
         echo
         echo "=== Stage 2/2: modules ==="
 
-        set +e
-
-        make \
-          "${COMMON_MAKE_ARGS[@]}" \
+        if ! make \
+          "${COMMON_ARGS[@]}" \
           -j"${JOBS}" \
           "${VERBOSE[@]}" \
-          modules
-
-        MODULE_STATUS=$?
-
-        set -e
-
-        if (( MODULE_STATUS != 0 )); then
-          echo
-          echo "=============================================="
-          echo " Module build failed"
-          echo "=============================================="
+          modules; then
 
           echo
-          echo "Running retry with -j1 V=1."
+          echo "modules failed. Retrying with -j1 V=1..."
 
           make \
-            "${COMMON_MAKE_ARGS[@]}" \
+            "${COMMON_ARGS[@]}" \
             -j1 \
             V=1 \
             modules
@@ -1381,30 +1099,23 @@ EOF
         echo
         echo "Kernel compilation completed."
 
+        RELEASE="$(
+          make \
+            O="${OUTPUT_DIR}" \
+            -s \
+            kernelrelease
+        )"
+
         echo
         echo "Kernel release:"
-
-        make \
-          O="${OUTPUT_DIR}" \
-          -s \
-          kernelrelease
+        echo "${RELEASE}"
 
         echo
-        echo "Built kernel image:"
+        echo "Kernel image:"
+        ls -lh "${OUTPUT_DIR}/arch/x86/boot/bzImage"
 
-        ls -lh \
-          "${OUTPUT_DIR}/arch/x86/boot/bzImage"
-
-        echo
-        echo "Build products:"
-
-        test -s \
-          "${OUTPUT_DIR}/arch/x86/boot/bzImage"
-
-        test -f \
-          "${OUTPUT_DIR}/System.map"
-
-        echo "Kernel image validation passed."
+        test -s "${OUTPUT_DIR}/arch/x86/boot/bzImage"
+        test -f "${OUTPUT_DIR}/System.map"
 
     - name: Verify built kernel configuration
       shell: bash
@@ -1418,50 +1129,33 @@ EOF
 
         cd "${SOURCE_DIR}"
 
-        echo "Running final post-build config verification..."
+        REQUIRED_Y=(
+          CONFIG_MODULES
+          CONFIG_X86_64
+          CONFIG_X86
+          CONFIG_64BIT
+          CONFIG_IA32_EMULATION
+        )
 
-        make \
-          O="${OUTPUT_DIR}" \
-          -s \
-          kernelrelease
-
-        for cfg in \
-          CONFIG_MODULES \
-          CONFIG_X86_64 \
-          CONFIG_X86 \
-          CONFIG_64BIT \
-          CONFIG_IA32_EMULATION; do
-
+        for cfg in "${REQUIRED_Y[@]}"; do
           if ! grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config"; then
-            echo "ERROR: ${cfg} is missing after build."
+            echo "ERROR: ${cfg} is not enabled after compilation."
             exit 1
           fi
         done
 
-        for cfg in \
-          CONFIG_SECURITY_APPARMOR \
-          CONFIG_UAPI_HEADER_TEST \
-          CONFIG_WERROR \
-          CONFIG_RUST \
-          CONFIG_GCC_PLUGINS \
-          CONFIG_DEBUG_INFO_BTF \
-          CONFIG_DEBUG_INFO_BTF_MODULES \
-          CONFIG_KASAN \
-          CONFIG_KCSAN \
-          CONFIG_KFENCE \
-          CONFIG_KCOV \
-          CONFIG_UBSAN; do
+        if grep -q '^CONFIG_SECURITY_APPARMOR=y$' "${OUTPUT_DIR}/.config" || grep -q '^CONFIG_SECURITY_APPARMOR=m$' "${OUTPUT_DIR}/.config"; then
+          echo "ERROR: CONFIG_SECURITY_APPARMOR is still enabled."
+          exit 1
+        fi
 
-          if grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config" ||
-             grep -q "^${cfg}=m$" "${OUTPUT_DIR}/.config"; then
-
-            echo "ERROR: ${cfg} unexpectedly enabled."
-            exit 1
-          fi
-        done
+        if grep -q '^CONFIG_UAPI_HEADER_TEST=y$' "${OUTPUT_DIR}/.config" || grep -q '^CONFIG_UAPI_HEADER_TEST=m$' "${OUTPUT_DIR}/.config"; then
+          echo "ERROR: CONFIG_UAPI_HEADER_TEST is still enabled."
+          exit 1
+        fi
 
         echo
-        echo "Critical configuration verified."
+        echo "Post-build configuration validation passed."
 
     - name: Install modules and generate initramfs
       shell: bash
@@ -1492,7 +1186,7 @@ EOF
           "${PACKAGE_DIR}/modules"
 
         echo
-        echo "Installing modules into package root..."
+        echo "Installing modules..."
 
         make \
           O="${OUTPUT_DIR}" \
@@ -1502,50 +1196,36 @@ EOF
 
         MODULE_ROOT="${PACKAGE_DIR}/modules/lib/modules/${RELEASE}"
 
-        if [[ ! -d "${MODULE_ROOT}" ]]; then
-          echo "ERROR: Module installation directory not found:"
-          echo "  ${MODULE_ROOT}"
-          exit 1
-        fi
+        test -d "${MODULE_ROOT}"
 
         echo
-        echo "Running depmod in package tree..."
+        echo "Generating module dependency files..."
 
         sudo depmod \
           -b "${PACKAGE_DIR}/modules" \
           "${RELEASE}"
 
-        if [[ ! -f "${MODULE_ROOT}/modules.dep" ]]; then
-          echo "ERROR: modules.dep was not generated."
-          exit 1
-        fi
+        test -f "${MODULE_ROOT}/modules.dep"
 
         echo
-        echo "Preparing temporary host module tree..."
+        echo "Generating initramfs..."
 
-        sudo rm -rf \
-          "/lib/modules/${RELEASE}"
-
-        sudo mkdir -p \
-          "/lib/modules/${RELEASE}"
+        sudo rm -rf "/lib/modules/${RELEASE}"
+        sudo mkdir -p "/lib/modules/${RELEASE}"
 
         sudo rsync \
           -a \
           "${MODULE_ROOT}/" \
           "/lib/modules/${RELEASE}/"
 
-        sudo depmod \
-          "${RELEASE}"
-
-        echo
-        echo "Generating initramfs..."
+        sudo depmod "${RELEASE}"
 
         sudo mkinitramfs \
           -o "${PACKAGE_DIR}/boot/initrd.img-${RELEASE}" \
           "${RELEASE}"
 
         echo
-        echo "Copying kernel image..."
+        echo "Copying kernel artifacts..."
 
         cp \
           "${OUTPUT_DIR}/arch/x86/boot/bzImage" \
@@ -1557,35 +1237,11 @@ EOF
             "${PACKAGE_DIR}/boot/System.map-${RELEASE}"
         fi
 
-        if [[ -f "${OUTPUT_DIR}/.config" ]]; then
-          cp \
-            "${OUTPUT_DIR}/.config" \
-            "${PACKAGE_DIR}/boot/config-${RELEASE}"
-        fi
+        cp \
+          "${OUTPUT_DIR}/.config" \
+          "${PACKAGE_DIR}/boot/config-${RELEASE}"
 
-        echo
-        echo "Checking generated initramfs:"
-
-        ls -lh \
-          "${PACKAGE_DIR}/boot/initrd.img-${RELEASE}"
-
-        test -s \
-          "${PACKAGE_DIR}/boot/initrd.img-${RELEASE}"
-
-        echo
-        echo "Removing temporary system modules..."
-
-        sudo rm -rf \
-          "/lib/modules/${RELEASE}"
-
-        echo
-        echo "Package tree:"
-
-        find "${PACKAGE_DIR}" \
-          -maxdepth 6 \
-          -type f \
-          -printf '%p %k KB\n' |
-          sort
+        sudo rm -rf "/lib/modules/${RELEASE}"
 
         echo
         echo "Package sizes:"
@@ -1593,6 +1249,14 @@ EOF
         du -sh \
           "${PACKAGE_DIR}/boot" \
           "${PACKAGE_DIR}/modules"
+
+        echo
+        echo "Package files:"
+
+        find "${PACKAGE_DIR}" \
+          -type f \
+          -printf '%p\n' |
+          sort
 
     - name: Collect build diagnostics
       if: always()
@@ -1630,41 +1294,18 @@ EOF
         sudo lvs || true
 
         echo
-        echo "Top build directories:"
-
-        du -xhd2 \
-          "${BUILD_ROOT}" \
-          2>/dev/null |
-          sort -h |
-          tail -50
-
-        echo
-        echo "Recent compiler command files:"
-
-        find "${OUTPUT_DIR}" \
-          -type f \
-          -name '*.cmd' |
-          tail -50
+        echo "Build directories:"
+        du -xhd2 "${BUILD_ROOT}" 2>/dev/null | sort -h | tail -50
 
         echo
         echo "Configuration:"
-
         grep -E \
           '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_KCOV|CONFIG_UBSAN)=' \
           "${OUTPUT_DIR}/.config" \
           2>/dev/null || true
 
         echo
-        echo "Disabled configuration:"
-
-        grep -E \
-          '^# CONFIG_(SECURITY_APPARMOR|SECURITY_TOMOYO|SECURITY_SMACK|SECURITY_LOADPIN|SECURITY_LANDLOCK|SECURITY_IPE|SECURITY_SAFESETID|SECURITY_YAMA|SECURITY_LOCKDOWN_LSM|BPF_LSM|UAPI_HEADER_TEST|WERROR|RUST|GCC_PLUGINS|DEBUG_INFO_BTF|DEBUG_INFO_BTF_MODULES|KASAN|KCSAN|KFENCE|KCOV|UBSAN) is not set$' \
-          "${OUTPUT_DIR}/.config" \
-          2>/dev/null || true
-
-        echo
         echo "Kernel release:"
-
         if [[ -f "${OUTPUT_DIR}/.config" ]]; then
           make \
             -C "${BUILD_ROOT}/linux-${{ inputs.kernel-version }}" \
@@ -1729,11 +1370,8 @@ EOF
           "${OUTPUT_DIR}/.config" \
           "${PACKAGE_DIR}/auraOS-kernel.config"
 
-        test -s \
-          "${PACKAGE_DIR}/auraOS-kernel-info.txt"
-
-        test -s \
-          "${PACKAGE_DIR}/auraOS-kernel.config"
+        test -s "${PACKAGE_DIR}/auraOS-kernel-info.txt"
+        test -s "${PACKAGE_DIR}/auraOS-kernel.config"
 
     - name: Validate final kernel artifacts
       shell: bash
@@ -1774,10 +1412,8 @@ EOF
         test -s \
           "${PACKAGE_DIR}/auraOS-kernel.config"
 
-        if [[ ! -d "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}" ]]; then
-          echo "ERROR: Final module directory does not exist."
-          exit 1
-        fi
+        test -d \
+          "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}"
 
         test -f \
           "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}/modules.dep"
@@ -1789,27 +1425,15 @@ EOF
           "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}/modules.symbols"
 
         echo
-        echo "Verifying kernel image magic:"
-
-        file \
-          "${OUTPUT_DIR}/arch/x86/boot/bzImage"
+        echo "Kernel image:"
+        file "${OUTPUT_DIR}/arch/x86/boot/bzImage"
 
         echo
-        echo "Verifying initramfs:"
-
-        file \
-          "${PACKAGE_DIR}/boot/initrd.img-${RELEASE}"
+        echo "Initramfs:"
+        file "${PACKAGE_DIR}/boot/initrd.img-${RELEASE}"
 
         echo
-        echo "Kernel artifact validation passed."
-
-        echo
-        echo "Artifacts:"
-
-        find "${PACKAGE_DIR}" \
-          -type f \
-          -printf '%p\n' |
-          sort
+        echo "Final kernel artifact validation passed."
 
     - name: Create auraOS kernel archive
       shell: bash
@@ -1820,7 +1444,6 @@ EOF
         set -euo pipefail
 
         BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        OUTPUT_DIR="${BUILD_ROOT}/output"
 
         RELEASE="$(
           make \
@@ -1861,7 +1484,6 @@ EOF
 
         echo
         echo "SHA256:"
-
         cat \
           "${ARCHIVE}.sha256"
 
