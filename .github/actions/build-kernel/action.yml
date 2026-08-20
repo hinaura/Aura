@@ -519,7 +519,7 @@ runs:
           --disable CONFIG_UBSAN \
           --disable CONFIG_UBSAN_TRAP \
           --disable CONFIG_DEBUG_OBJECTS \
-          --enable CONFIG_DRM \
+          --set-val CONFIG_DRM y \
           --disable CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS \
           --disable CONFIG_DEBUG_LIST \
           --disable CONFIG_DEBUG_SG \
