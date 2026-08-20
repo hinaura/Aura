@@ -137,10 +137,11 @@ runs:
         echo " auraOS kernel build environment"
         echo "=============================================="
 
+        echo
         echo "Runner:"
         uname -a
-        echo
 
+        echo
         echo "Architecture:"
         ARCH="$(uname -m)"
         echo "${ARCH}"
@@ -174,6 +175,14 @@ runs:
         echo "Temporary directories:"
         ls -ld /tmp /var/tmp 2>/dev/null || true
         ls -ld /mnt 2>/dev/null || true
+
+        echo
+        echo "Tool versions:"
+        bash --version | head -n 1
+        gcc --version | head -n 1
+        make --version | head -n 1
+        ld --version | head -n 1
+        dpkg --version | head -n 1
 
     - name: Maximize build disk space
       shell: bash
@@ -238,6 +247,12 @@ runs:
 
         sudo mkdir -p "${BUILD_MOUNT_PATH}"
 
+        if sudo vgs "${VG_NAME}" >/dev/null 2>&1; then
+          echo "ERROR: Volume group ${VG_NAME} already exists."
+          sudo vgdisplay "${VG_NAME}" || true
+          exit 1
+        fi
+
         ROOT_FREE_KB="$(
           df --block-size=1024 --output=avail / |
           tail -n 1 |
@@ -260,6 +275,7 @@ runs:
         echo "Root free before LVM: ${ROOT_FREE_KB} KiB"
         echo "Root LVM size:       ${ROOT_LVM_SIZE_KB} KiB"
 
+        sudo rm -f "${{ inputs.pv-loop-path }}"
         sudo touch "${{ inputs.pv-loop-path }}"
 
         if [[ "${{ inputs.overprovision-lvm }}" == "true" ]]; then
@@ -279,7 +295,12 @@ runs:
             "${{ inputs.pv-loop-path }}"
         )"
 
-        sudo pvcreate -ff -y "${ROOT_LOOP_DEV}"
+        echo "Root loop device: ${ROOT_LOOP_DEV}"
+
+        sudo pvcreate \
+          -ff \
+          -y \
+          "${ROOT_LOOP_DEV}"
 
         PV_DEVICES=("${ROOT_LOOP_DEV}")
 
@@ -303,6 +324,7 @@ runs:
             sudo mkdir -p \
               "$(dirname "${{ inputs.tmp-pv-loop-path }}")"
 
+            sudo rm -f "${{ inputs.tmp-pv-loop-path }}"
             sudo touch "${{ inputs.tmp-pv-loop-path }}"
 
             if [[ "${{ inputs.overprovision-lvm }}" == "true" ]]; then
@@ -322,7 +344,12 @@ runs:
                 "${{ inputs.tmp-pv-loop-path }}"
             )"
 
-            sudo pvcreate -ff -y "${TMP_LOOP_DEV}"
+            echo "Temp loop device: ${TMP_LOOP_DEV}"
+
+            sudo pvcreate \
+              -ff \
+              -y \
+              "${TMP_LOOP_DEV}"
 
             PV_DEVICES+=("${TMP_LOOP_DEV}")
           else
@@ -339,6 +366,7 @@ runs:
           "${VG_NAME}" \
           "${PV_DEVICES[@]}"
 
+        echo
         echo "Creating swap LV..."
 
         sudo lvcreate \
@@ -352,12 +380,17 @@ runs:
         sudo swapon \
           "/dev/${VG_NAME}/swap"
 
+        echo
         echo "Creating build LV..."
 
-        sudo lvcreate \
+        if ! sudo lvcreate \
           -l 100%FREE \
           -n buildlv \
-          "${VG_NAME}"
+          "${VG_NAME}"; then
+          echo "ERROR: Failed to create build LV."
+          sudo vgdisplay "${VG_NAME}" || true
+          exit 1
+        fi
 
         sudo mkfs.ext4 \
           -m 0 \
@@ -379,6 +412,16 @@ runs:
         echo
         echo "Build filesystem inodes:"
         df -ih "${BUILD_MOUNT_PATH}"
+
+        echo
+        echo "LVM:"
+        sudo pvs || true
+        sudo vgs || true
+        sudo lvs || true
+
+        echo
+        echo "Swap:"
+        swapon --show || true
 
     - name: Install kernel build dependencies
       shell: bash
@@ -412,7 +455,8 @@ runs:
           bzip2 \
           gzip \
           openssl \
-          initramfs-tools
+          initramfs-tools \
+          lz4
 
         echo
         echo "Toolchain:"
@@ -421,6 +465,35 @@ runs:
         ld --version | head -n 1
         pahole --version || true
         openssl version
+
+        echo
+        echo "Required binaries:"
+        for tool in \
+          gcc \
+          g++ \
+          make \
+          ld \
+          ar \
+          nm \
+          objcopy \
+          strip \
+          bc \
+          flex \
+          bison \
+          perl \
+          rsync \
+          depmod \
+          mkinitramfs \
+          dpkg-deb \
+          curl \
+          tar \
+          zstd \
+          lz4; do
+          if ! command -v "${tool}" >/dev/null 2>&1; then
+            echo "ERROR: Required tool not found: ${tool}"
+            exit 1
+          fi
+        done
 
     - name: Download Ubuntu Linux source
       shell: bash
@@ -454,6 +527,7 @@ runs:
             --fail \
             --location \
             --retry 4 \
+            --retry-all-errors \
             --retry-delay 2 \
             --connect-timeout 20 \
             --max-time 600 \
@@ -478,6 +552,14 @@ runs:
         echo
         echo "Downloaded source package:"
         ls -lh "${SOURCE_DEB}"
+
+        echo
+        echo "Checking Debian package..."
+
+        dpkg-deb \
+          --info \
+          "${SOURCE_DEB}" |
+          head -80
 
         echo
         echo "Extracting source package..."
@@ -516,6 +598,10 @@ runs:
           exit 1
         fi
 
+        echo
+        echo "Source archive:"
+        echo "  ${SOURCE_TARBALL}"
+
         case "${SOURCE_TARBALL}" in
           *.tar.bz2)
             tar \
@@ -543,6 +629,7 @@ runs:
         esac
 
         test -f "${SOURCE_DIR}/Makefile"
+        test -f "${SOURCE_DIR}/Kconfig"
         test -d "${SOURCE_DIR}/drivers"
         test -d "${SOURCE_DIR}/kernel"
 
@@ -553,6 +640,12 @@ runs:
         echo
         echo "Kernel Makefile:"
         head -n 8 "${SOURCE_DIR}/Makefile"
+
+        echo
+        echo "Kernel version reported by source:"
+        make \
+          -C "${SOURCE_DIR}" \
+          kernelversion
 
         echo
         echo "Driver directories:"
@@ -583,52 +676,58 @@ runs:
         CONFIG_EXTRA="${OUTPUT_DIR}/auraOS-extra.config"
 
         cat > "${CONFIG_EXTRA}" <<'EOF'
-        CONFIG_MODULES=y
-        CONFIG_KALLSYMS=y
-        CONFIG_KALLSYMS_ALL=y
-        CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
+CONFIG_MODULES=y
+CONFIG_KALLSYMS=y
+CONFIG_KALLSYMS_ALL=y
+CONFIG_DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT=y
 
-        # Broad hardware coverage.
-        CONFIG_PCI=y
-        CONFIG_PCIEPORTBUS=y
-        CONFIG_SCSI=m
-        CONFIG_ATA=m
-        CONFIG_SATA_AHCI=m
-        CONFIG_BLK_DEV=m
-        CONFIG_MD=m
-        CONFIG_DM_CRYPT=m
-        CONFIG_DRM=m
-        CONFIG_SOUND=m
-        CONFIG_HID=m
-        CONFIG_USB=m
-        CONFIG_USB_SUPPORT=y
-        CONFIG_NET=y
-        CONFIG_INET=y
-        CONFIG_IPV6=y
-        CONFIG_WLAN=m
-        CONFIG_BT=m
-        CONFIG_INPUT=m
-        CONFIG_I2C=m
-        CONFIG_SPI=m
-        CONFIG_PNP=y
-        CONFIG_ACPI=y
-        CONFIG_HWMON=m
-        CONFIG_RTC_CLASS=m
-        CONFIG_MTD=m
-        CONFIG_NVMEM=m
-        CONFIG_FW_LOADER=y
-        CONFIG_DEVTMPFS=y
-        CONFIG_DEVTMPFS_MOUNT=y
-        CONFIG_TMPFS=y
+# Broad hardware coverage.
+CONFIG_PCI=y
+CONFIG_PCIEPORTBUS=y
+CONFIG_SCSI=m
+CONFIG_ATA=m
+CONFIG_SATA_AHCI=m
+CONFIG_BLK_DEV=m
+CONFIG_MD=m
+CONFIG_DM_CRYPT=m
+CONFIG_DRM=m
+CONFIG_SOUND=m
+CONFIG_HID=m
+CONFIG_USB=m
+CONFIG_USB_SUPPORT=y
+CONFIG_NET=y
+CONFIG_INET=y
+CONFIG_IPV6=y
+CONFIG_WLAN=m
+CONFIG_BT=m
+CONFIG_INPUT=m
+CONFIG_I2C=m
+CONFIG_SPI=m
+CONFIG_PNP=y
+CONFIG_ACPI=y
+CONFIG_HWMON=m
+CONFIG_RTC_CLASS=m
+CONFIG_MTD=m
+CONFIG_NVMEM=m
+CONFIG_FW_LOADER=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_TMPFS=y
 
-        # Avoid optional toolchain-dependent paths.
-        CONFIG_RUST=n
-        CONFIG_GCC_PLUGINS=n
-        CONFIG_WERROR=n
+# Avoid optional toolchain-dependent paths.
+CONFIG_RUST=n
+CONFIG_GCC_PLUGINS=n
+CONFIG_WERROR=n
 
-        # BTF is deliberately left disabled for the first stable build.
-        CONFIG_DEBUG_INFO_BTF=n
-        EOF
+# Do not run standalone C90 tests of exported UAPI headers.
+# The Ubuntu 6.8 AppArmor UAPI header in this source revision
+# fails this developer-oriented validation independently of
+# the actual kernel build.
+CONFIG_UAPI_HEADER_TEST=n
+
+# BTF is deliberately disabled for the first stable build.
+CONFIG_DEBUG_INFO_BTF=n
+EOF
 
         export KCONFIG_CONFIG="${OUTPUT_DIR}/.config"
         export KCONFIG_ALLCONFIG="${CONFIG_EXTRA}"
@@ -668,7 +767,7 @@ runs:
         unset KCONFIG_ALLCONFIG
 
         echo
-        echo "Applying explicit release and architecture settings..."
+        echo "Applying explicit configuration overrides..."
 
         "${SOURCE_DIR}/scripts/config" \
           --file "${OUTPUT_DIR}/.config" \
@@ -676,6 +775,7 @@ runs:
           --disable CONFIG_RUST \
           --disable CONFIG_GCC_PLUGINS \
           --disable CONFIG_DEBUG_INFO_BTF \
+          --disable CONFIG_UAPI_HEADER_TEST \
           --enable CONFIG_MODULES \
           --enable CONFIG_KALLSYMS \
           --enable CONFIG_KALLSYMS_ALL \
@@ -714,10 +814,30 @@ runs:
           exit 1
         fi
 
+        if grep -q '^CONFIG_UAPI_HEADER_TEST=y$' "${OUTPUT_DIR}/.config"; then
+          echo "ERROR: CONFIG_UAPI_HEADER_TEST must be disabled."
+          exit 1
+        fi
+
+        if grep -q '^CONFIG_WERROR=y$' "${OUTPUT_DIR}/.config"; then
+          echo "ERROR: CONFIG_WERROR must be disabled."
+          exit 1
+        fi
+
+        if grep -q '^CONFIG_RUST=y$' "${OUTPUT_DIR}/.config"; then
+          echo "ERROR: CONFIG_RUST must be disabled."
+          exit 1
+        fi
+
+        if grep -q '^CONFIG_DEBUG_INFO_BTF=y$' "${OUTPUT_DIR}/.config"; then
+          echo "ERROR: CONFIG_DEBUG_INFO_BTF must be disabled."
+          exit 1
+        fi
+
         echo
         echo "Selected configuration:"
         grep -E \
-          '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_DEBUG_INFO_BTF|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS)=' \
+          '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DEBUG_INFO_BTF|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS)=' \
           "${OUTPUT_DIR}/.config" || true
 
         echo
@@ -733,6 +853,12 @@ runs:
 
         printf '  Disabled: '
         grep -Ec '^# CONFIG_[A-Za-z0-9_]+ is not set$' \
+          "${OUTPUT_DIR}/.config" || true
+
+        echo
+        echo "Checking whether problematic UAPI test is disabled:"
+        grep -E \
+          '^# CONFIG_UAPI_HEADER_TEST is not set$' \
           "${OUTPUT_DIR}/.config" || true
 
     - name: Pre-build resource check
@@ -773,6 +899,11 @@ runs:
         echo "Available space on all filesystems:"
         df -h
 
+        echo
+        echo "Kernel configuration file:"
+        ls -lh \
+          "${BUILD_ROOT}/build/.config"
+
     - name: Build auraOS kernel
       shell: bash
       working-directory: ${{ github.workspace }}
@@ -795,6 +926,11 @@ runs:
 
         if [[ -n "${{ inputs.kernel-jobs }}" ]]; then
           JOBS="${{ inputs.kernel-jobs }}"
+
+          if ! [[ "${JOBS}" =~ ^[0-9]+$ ]] || (( JOBS < 1 )); then
+            echo "ERROR: kernel-jobs must be a positive integer."
+            exit 1
+          fi
         elif (( CPU_COUNT > 2 )); then
           JOBS="$((CPU_COUNT - 1))"
         else
@@ -817,6 +953,8 @@ runs:
         echo "Architecture:   $(uname -m)"
         echo "Build user:     ${KBUILD_BUILD_USER}"
         echo "Build host:     ${KBUILD_BUILD_HOST}"
+        echo "Build version:  ${KBUILD_BUILD_VERSION}"
+        echo "Build timestamp: ${KBUILD_BUILD_TIMESTAMP}"
         echo "=============================================="
 
         export MAKEFLAGS="-Otarget"
@@ -849,7 +987,7 @@ runs:
 
           echo
           echo "Retrying with -j1 V=1."
-          echo "The following run is intended to expose the FIRST real error."
+          echo "The following run is intended to expose the first real error."
 
           make \
             O="${OUTPUT_DIR}" \
@@ -893,7 +1031,7 @@ runs:
 
           echo
           echo "Retrying with -j1 V=1."
-          echo "The following run is intended to expose the FIRST real error."
+          echo "The following run is intended to expose the first real error."
 
           make \
             O="${OUTPUT_DIR}" \
@@ -918,6 +1056,11 @@ runs:
           O="${OUTPUT_DIR}" \
           -s \
           kernelrelease
+
+        echo
+        echo "Built kernel image:"
+        ls -lh \
+          "${OUTPUT_DIR}/arch/x86/boot/bzImage"
 
     - name: Install modules and generate initramfs
       shell: bash
@@ -956,19 +1099,33 @@ runs:
           INSTALL_MOD_PATH="${PACKAGE_DIR}/modules" \
           INSTALL_MOD_STRIP=1
 
+        MODULE_ROOT="${PACKAGE_DIR}/modules/lib/modules/${RELEASE}"
+
+        if [[ ! -d "${MODULE_ROOT}" ]]; then
+          echo "ERROR: Module installation directory not found:"
+          echo "  ${MODULE_ROOT}"
+          exit 1
+        fi
+
+        echo
+        echo "Running depmod in package tree..."
+
         sudo depmod \
           -b "${PACKAGE_DIR}/modules" \
           "${RELEASE}"
 
         echo
-        echo "Preparing temporary module tree..."
+        echo "Preparing temporary host module tree..."
 
-        sudo rm -rf "/lib/modules/${RELEASE}"
-        sudo mkdir -p "/lib/modules/${RELEASE}"
+        sudo rm -rf \
+          "/lib/modules/${RELEASE}"
+
+        sudo mkdir -p \
+          "/lib/modules/${RELEASE}"
 
         sudo rsync \
           -a \
-          "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}/" \
+          "${MODULE_ROOT}/" \
           "/lib/modules/${RELEASE}/"
 
         sudo depmod \
@@ -1009,10 +1166,16 @@ runs:
         echo
         echo "Package tree:"
         find "${PACKAGE_DIR}" \
-          -maxdepth 5 \
+          -maxdepth 6 \
           -type f \
           -printf '%p %k KB\n' |
           sort
+
+        echo
+        echo "Package sizes:"
+        du -sh \
+          "${PACKAGE_DIR}/boot" \
+          "${PACKAGE_DIR}/modules"
 
     - name: Collect build diagnostics
       if: always()
@@ -1044,6 +1207,12 @@ runs:
         swapon --show || true
 
         echo
+        echo "LVM:"
+        sudo pvs || true
+        sudo vgs || true
+        sudo lvs || true
+
+        echo
         echo "Top build directories:"
         du -xhd2 \
           "${BUILD_ROOT}" \
@@ -1061,9 +1230,27 @@ runs:
         echo
         echo "Configuration:"
         grep -E \
-          '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_64BIT|CONFIG_DEBUG_INFO_BTF|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS)=' \
+          '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DEBUG_INFO_BTF|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS)=' \
           "${OUTPUT_DIR}/.config" \
           2>/dev/null || true
+
+        echo
+        echo "Disabled configuration:"
+        grep -E \
+          '^# CONFIG_(UAPI_HEADER_TEST|WERROR|RUST|GCC_PLUGINS|DEBUG_INFO_BTF) is not set$' \
+          "${OUTPUT_DIR}/.config" \
+          2>/dev/null || true
+
+        echo
+        echo "Kernel release:"
+        if [[ -f "${OUTPUT_DIR}/.config" ]]; then
+          make \
+            -C "${BUILD_ROOT}/linux-${{ inputs.kernel-version }}" \
+            O="${OUTPUT_DIR}" \
+            -s \
+            kernelrelease \
+            2>/dev/null || true
+        fi
 
     - name: Create auraOS kernel metadata
       shell: bash
@@ -1084,6 +1271,8 @@ runs:
             kernelrelease
         )"
 
+        mkdir -p "${PACKAGE_DIR}"
+
         {
           echo "auraOS kernel"
           echo "Kernel version: ${{ inputs.kernel-version }}"
@@ -1091,17 +1280,74 @@ runs:
           echo "Kernel release: ${RELEASE}"
           echo "Architecture: x86_64"
           echo "Kernel config: ${{ inputs.kernel-config }}"
+          echo "UAPI header test: disabled"
           echo "Build user: ${{ inputs.kernel-build-user }}"
           echo "Build host: ${{ inputs.kernel-build-host }}"
           echo "Build version: ${{ inputs.kernel-build-version }}"
           echo "Build timestamp: ${{ inputs.kernel-build-timestamp }}"
           echo "Local version: ${{ inputs.kernel-localversion }}"
           echo "CPU count: $(nproc)"
+          echo "Compiler: $(gcc --version | head -n 1)"
+          echo "Binutils: $(ld --version | head -n 1)"
         } > "${PACKAGE_DIR}/auraOS-kernel-info.txt"
 
         cp \
           "${OUTPUT_DIR}/.config" \
           "${PACKAGE_DIR}/auraOS-kernel.config"
+
+    - name: Validate final kernel artifacts
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        OUTPUT_DIR="${BUILD_ROOT}/build"
+        PACKAGE_DIR="${BUILD_ROOT}/output"
+
+        RELEASE="$(
+          make \
+            -C "${SOURCE_DIR}" \
+            O="${OUTPUT_DIR}" \
+            -s \
+            kernelrelease
+        )"
+
+        echo "Validating release: ${RELEASE}"
+
+        test -s \
+          "${OUTPUT_DIR}/arch/x86/boot/bzImage"
+
+        test -s \
+          "${PACKAGE_DIR}/boot/vmlinuz-${RELEASE}"
+
+        test -s \
+          "${PACKAGE_DIR}/boot/initrd.img-${RELEASE}"
+
+        test -s \
+          "${PACKAGE_DIR}/boot/config-${RELEASE}"
+
+        test -s \
+          "${PACKAGE_DIR}/auraOS-kernel-info.txt"
+
+        test -s \
+          "${PACKAGE_DIR}/auraOS-kernel.config"
+
+        if [[ -d "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}" ]]; then
+          test -f \
+            "${PACKAGE_DIR}/modules/lib/modules/${RELEASE}/modules.dep"
+        fi
+
+        echo
+        echo "Kernel artifact validation passed."
+
+        echo
+        echo "Artifacts:"
+        find "${PACKAGE_DIR}" \
+          -type f \
+          -printf '%p\n' |
+          sort
 
     - name: Create auraOS kernel archive
       shell: bash
@@ -1124,6 +1370,10 @@ runs:
 
         ARCHIVE="auraOS-kernel-${RELEASE}-x86_64.tar.gz"
 
+        rm -f \
+          "${ARCHIVE}" \
+          "${ARCHIVE}.sha256"
+
         tar \
           --sort=name \
           --mtime='UTC 2026-08-20' \
@@ -1144,6 +1394,11 @@ runs:
           "${ARCHIVE}" \
           "${ARCHIVE}.sha256"
 
+        echo
+        echo "SHA256:"
+        cat \
+          "${ARCHIVE}.sha256"
+
     - name: Upload auraOS kernel
       uses: actions/upload-artifact@v6
       with:
@@ -1159,6 +1414,8 @@ runs:
       if: always()
       shell: bash
       run: |
+        set +e
+
         echo "=============================================="
         echo " Final resources"
         echo "=============================================="
@@ -1178,6 +1435,20 @@ runs:
         echo
         echo "Inodes:"
         df -ih
+
+        echo
+        echo "LVM:"
+        sudo pvs || true
+        sudo vgs || true
+        sudo lvs || true
+
+        echo
+        echo "Build workspace:"
+        if [[ -d "${GITHUB_WORKSPACE}/auraOS-kernel" ]]; then
+          du -sh \
+            "${GITHUB_WORKSPACE}/auraOS-kernel" \
+            2>/dev/null || true
+        fi
 
         echo
         echo "auraOS kernel action finished."
