@@ -439,7 +439,7 @@ runs:
         CONFIG_SATA_AHCI=m
         CONFIG_MD=m
         CONFIG_DM_CRYPT=m
-        CONFIG_DRM=m
+        CONFIG_DRM=y
         CONFIG_SOUND=m
         CONFIG_HID=m
         CONFIG_USB=m
@@ -519,9 +519,8 @@ runs:
           --disable CONFIG_UBSAN \
           --disable CONFIG_UBSAN_TRAP \
           --disable CONFIG_DEBUG_OBJECTS \
+          --set-val CONFIG_DRM y \
           --disable CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS \
-          --set-val CONFIG_DRM_KMS_HELPER m \
-          --set-val CONFIG_DRM_FBDEV_EMULATION m \
           --disable CONFIG_DEBUG_LIST \
           --disable CONFIG_DEBUG_SG \
           --disable CONFIG_DEBUG_NOTIFIERS \
@@ -736,10 +735,14 @@ runs:
         OUTPUT_DIR="${BUILD_ROOT}/build"
         test -f "${OUTPUT_DIR}/.config"
         cd "${SOURCE_DIR}"
-        echo "Re-asserting DRM built-in/module consistency after the PAGE_EXTENSION fixpoint loop..."
+        echo "Re-asserting CONFIG_DRM=y after the PAGE_EXTENSION fixpoint loop..."
+        # scripts/config can't hold a symbol DOWN against an active "select"
+        # (Kconfig's olddefconfig just re-selects it back up), so pushing
+        # CONFIG_DRM_KMS_HELPER down to =m does not stick. Pushing CONFIG_DRM
+        # itself UP to =y does stick (nothing forces it back down), and =y is
+        # consistent with any built-in helper that selects it.
         "${SOURCE_DIR}/scripts/config" --file "${OUTPUT_DIR}/.config" \
-          --set-val CONFIG_DRM_KMS_HELPER m \
-          --set-val CONFIG_DRM_FBDEV_EMULATION m
+          --set-val CONFIG_DRM y
         make O="${OUTPUT_DIR}" olddefconfig
         REQUIRED_Y=(CONFIG_MODULES CONFIG_X86_64 CONFIG_X86 CONFIG_64BIT CONFIG_KALLSYMS CONFIG_IA32_EMULATION)
         for cfg in "${REQUIRED_Y[@]}"; do
