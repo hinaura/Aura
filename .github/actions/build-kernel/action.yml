@@ -608,34 +608,64 @@ runs:
         PATCHED=0
 
         # Ubuntu's 6.8.0-138 tree can contain the newer gen_raw_regmap()
-        # implementation body (which uses the KUnit test object) without the
-        # corresponding struct kunit *test parameter and caller updates.
+        # implementation body, which uses the KUnit test object, without
+        # the corresponding struct kunit *test parameter and caller updates.
         # The resulting build failure is:
-        #   error: ‘test’ undeclared (first use in this function)
-        # Upstream's fixed form takes struct kunit *test explicitly and passes
-        # it from every caller.
+        #   error: 'test' undeclared (first use in this function)
+        # Upstream's fixed form passes struct kunit *test explicitly from
+        # every caller. In this Ubuntu tree gen_raw_regmap() still has the
+        # older raw_test_types *test_type argument, so retain that argument
+        # and add only the missing KUnit test parameter.
         if grep -q '^static struct regmap \*gen_raw_regmap(struct regmap_config \*config,$' "${REGMAP_KUNIT}" \
             && grep -q 'kunit_kcalloc(test,' "${REGMAP_KUNIT}"; then
           echo "Patching gen_raw_regmap() to receive struct kunit *test"
           sed -i \
             's/^static struct regmap \*gen_raw_regmap(struct regmap_config \*config,$/static struct regmap *gen_raw_regmap(struct kunit *test,\n\tstruct regmap_config *config,/' \
             "${REGMAP_KUNIT}"
-          sed -i 's/gen_raw_regmap(\&config, \&data)/gen_raw_regmap(test, \&config, \&data)/g' "${REGMAP_KUNIT}"
+
+          # This source revision still calls the helper as:
+          #   gen_raw_regmap(&config, t, &data)
+          # Add test to every such caller. Do not match the function
+          # declaration because it does not contain &config.
+          BEFORE_CALLS="$(grep -Ec 'gen_raw_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
+          if [[ "${BEFORE_CALLS}" -eq 0 ]]; then
+            echo "ERROR: expected gen_raw_regmap(&config, ...) callers were not found."
+            exit 1
+          fi
+          sed -i 's/gen_raw_regmap(&config,/gen_raw_regmap(test, \&config,/g' "${REGMAP_KUNIT}"
           PATCHED=1
         fi
 
         if [[ "${PATCHED}" -eq 1 ]]; then
           echo
           echo "Verifying regmap KUnit patch:"
-          grep -n -A2 '^static struct regmap \*gen_raw_regmap' "${REGMAP_KUNIT}"
-          if grep -q 'gen_raw_regmap(\&config, \&data)' "${REGMAP_KUNIT}"; then
-            echo "ERROR: unpatched gen_raw_regmap() caller remains."
+          grep -n -A3 '^static struct regmap \*gen_raw_regmap' "${REGMAP_KUNIT}"
+
+          # The helper must have the new test parameter while retaining the
+          # existing raw_test_types parameter.
+          if ! grep -q '^static struct regmap \*gen_raw_regmap(struct kunit \*test,$' "${REGMAP_KUNIT}"; then
+            echo "ERROR: gen_raw_regmap() signature was not patched correctly."
             exit 1
           fi
-          if ! grep -q 'gen_raw_regmap(test, \&config, \&data)' "${REGMAP_KUNIT}"; then
-            echo "ERROR: no patched gen_raw_regmap() caller found."
+          if ! grep -q 'struct raw_test_types \*test_type,' "${REGMAP_KUNIT}"; then
+            echo "ERROR: existing raw_test_types parameter was unexpectedly lost."
             exit 1
           fi
+
+          REMAINING="$(grep -Ec 'gen_raw_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
+          if [[ "${REMAINING}" -ne 0 ]]; then
+            echo "ERROR: ${REMAINING} unpatched gen_raw_regmap() caller(s) remain."
+            grep -n 'gen_raw_regmap(' "${REGMAP_KUNIT}"
+            exit 1
+          fi
+
+          PATCHED_CALLS="$(grep -Ec 'gen_raw_regmap\(test, &config,' "${REGMAP_KUNIT}" || true)"
+          if [[ "${PATCHED_CALLS}" -eq 0 ]]; then
+            echo "ERROR: no patched gen_raw_regmap() callers found."
+            exit 1
+          fi
+
+          echo "Patched ${PATCHED_CALLS} gen_raw_regmap() caller(s)."
           echo "regmap KUnit backport fix applied successfully."
         else
           echo "No known-broken regmap KUnit pattern found; source may already be fixed upstream."
