@@ -409,6 +409,77 @@ runs:
         echo "RCU list API references:"
         grep -n 'list_for_each_entry_rcu' include/linux/rculist.h | head -10 || true
 
+    - name: Fix known Ubuntu cifs/smbdirect.c build issue
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        SMBDIRECT="${SOURCE_DIR}/fs/smb/client/smbdirect.c"
+        cd "${SOURCE_DIR}"
+        echo "Checking cifs/smbdirect.c for known Ubuntu 6.8.0-138 backport breakage..."
+        test -f "${SMBDIRECT}"
+
+        PATCHED=0
+
+        # 1) smbd_post_send_iter() references an undeclared 'sp' pointer.
+        #    Upstream later introduced a "peer socket parameters" struct
+        #    (smbdirect_socket_parameters, accessed as sc->parameters via a
+        #    local 'sp' shortcut) as part of a much larger 2026 smbdirect
+        #    refactor ("smb: common: introduce and use common smbdirect
+        #    headers/structures"), and a follow-up commit ("smb: client: let
+        #    smbd_post_send_iter() respect the peers max_send_size and
+        #    transmit all data") switched this one line to use it.
+        #    That struct/field does NOT exist anywhere in this 6.8.0-138.138
+        #    tree (confirmed: fs/smb/common/smbdirect/smbdirect_socket.h here
+        #    has no "parameters" member at all), so Ubuntu's backport of that
+        #    later commit is incomplete/inapplicable to this kernel version.
+        #    In this tree the negotiated send size is simply
+        #    smbd_connection::max_send_size (i.e. 'info->max_send_size'),
+        #    which is exactly what every other line in this function already
+        #    uses. Realigning this line to match fixes:
+        #      error: 'sp' undeclared (first use in this function)
+        if grep -q 'sp->max_send_size - sizeof(\*packet));' "${SMBDIRECT}"; then
+          echo "Patching: sp->max_send_size -> info->max_send_size"
+          sed -i 's/sp->max_send_size - sizeof(\*packet));/info->max_send_size - sizeof(*packet));/' "${SMBDIRECT}"
+          PATCHED=1
+        fi
+
+        # 2) smbd_destroy() calls disable_work_sync(), which was added to the
+        #    kernel workqueue API by Tejun Heo's "workqueue: Implement
+        #    disable/enable_work()" series, merged for v6.10 (2024) - i.e.
+        #    strictly newer than this 6.8.0 tree, whose
+        #    include/linux/workqueue.h only declares cancel_work_sync()
+        #    (confirmed by grep against the actual downloaded source).
+        #    cancel_work_sync() is already used elsewhere in this same file
+        #    for the equivalent teardown purpose, so use it here too. Fixes:
+        #      error: implicit declaration of function 'disable_work_sync'
+        if grep -q 'disable_work_sync(&info->post_send_credits_work);' "${SMBDIRECT}"; then
+          echo "Patching: disable_work_sync() -> cancel_work_sync()"
+          sed -i 's/disable_work_sync(&info->post_send_credits_work);/cancel_work_sync(\&info->post_send_credits_work);/' "${SMBDIRECT}"
+          PATCHED=1
+        fi
+
+        if [[ "${PATCHED}" -eq 1 ]]; then
+          echo
+          echo "Verifying patch applied cleanly:"
+          grep -n 'info->max_send_size - sizeof(\*packet));' "${SMBDIRECT}"
+          grep -n 'cancel_work_sync(&info->post_send_credits_work);' "${SMBDIRECT}"
+          if grep -q '\bsp->max_send_size\b' "${SMBDIRECT}"; then
+            echo "ERROR: stray 'sp->max_send_size' reference remains after patching."
+            exit 1
+          fi
+          if grep -q 'disable_work_sync(' "${SMBDIRECT}"; then
+            echo "ERROR: stray 'disable_work_sync(' reference remains after patching."
+            exit 1
+          fi
+          echo
+          echo "cifs/smbdirect.c patched successfully."
+        else
+          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
+        fi
+
     - name: Configure auraOS kernel
       shell: bash
       working-directory: ${{ github.workspace }}
