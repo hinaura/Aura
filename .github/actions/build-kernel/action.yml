@@ -519,6 +519,7 @@ runs:
           --disable CONFIG_UBSAN \
           --disable CONFIG_UBSAN_TRAP \
           --disable CONFIG_DEBUG_OBJECTS \
+          --set-val CONFIG_AGP n \
           --set-val CONFIG_DRM y \
           --disable CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS \
           --disable CONFIG_DEBUG_LIST \
@@ -736,12 +737,16 @@ runs:
         test -f "${OUTPUT_DIR}/.config"
         cd "${SOURCE_DIR}"
         echo "Re-asserting CONFIG_DRM=y after the PAGE_EXTENSION fixpoint loop..."
-        # scripts/config can't hold a symbol DOWN against an active "select"
-        # (Kconfig's olddefconfig just re-selects it back up), so pushing
-        # CONFIG_DRM_KMS_HELPER down to =m does not stick. Pushing CONFIG_DRM
-        # itself UP to =y does stick (nothing forces it back down), and =y is
-        # consistent with any built-in helper that selects it.
+        # menuconfig DRM has: depends on (AGP || AGP=n) && !EMULATED_CMPXCHG && HAS_DMA
+        # Under tristate logic, "(AGP || AGP=n)" evaluates to =m whenever
+        # CONFIG_AGP=m (our allmodconfig default), which caps DRM's own
+        # settable range at =m -- so "--set-val CONFIG_DRM y" can never
+        # actually stick until AGP is forced to n (or y) first. This is the
+        # real root cause of the drm_fb_helper/drm.ko link failures, verified
+        # by replaying this exact override sequence through the real 6.8
+        # Kconfig tree with kconfiglib.
         "${SOURCE_DIR}/scripts/config" --file "${OUTPUT_DIR}/.config" \
+          --set-val CONFIG_AGP n \
           --set-val CONFIG_DRM y
         make O="${OUTPUT_DIR}" olddefconfig
         REQUIRED_Y=(CONFIG_MODULES CONFIG_X86_64 CONFIG_X86 CONFIG_64BIT CONFIG_KALLSYMS CONFIG_IA32_EMULATION)
