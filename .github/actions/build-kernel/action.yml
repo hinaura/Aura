@@ -810,6 +810,74 @@ runs:
           echo "No known-broken gen_regmap() pattern found; source may already be fixed upstream."
         fi
 
+    - name: Fix known Ubuntu v3d_drv.c missing brace build issue
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        V3D_DRV="${SOURCE_DIR}/drivers/gpu/drm/v3d/v3d_drv.c"
+        cd "${SOURCE_DIR}"
+        echo "Checking drivers/gpu/drm/v3d/v3d_drv.c for known missing closing brace..."
+        test -f "${V3D_DRV}"
+
+        PATCHED=0
+
+        # v3d_open() is missing the closing '}' for its
+        # "for (i = 0; i < V3D_MAX_QUEUES; i++) { ... }" loop, right after
+        # the "if (ret) goto err_sched;" line. Without it, the compiler
+        # treats every subsequent top-level function in the file
+        # (v3d_postclose, v3d_show_fdinfo, map_regs,
+        # v3d_platform_drm_probe, v3d_platform_drm_remove, the
+        # module_platform_driver() init/exit thunks, etc.) as nested
+        # inside v3d_open(), producing a long cascade of unrelated-looking
+        # errors, e.g.:
+        #   error: invalid storage class for function 'v3d_postclose'
+        #   error: initializer element is not constant
+        #   error: expected declaration or statement at end of input
+        # Adding the missing '}' right after the loop's "goto err_sched;"
+        # closes the for-loop where it was always meant to end and fixes
+        # the whole cascade.
+        PYRESULT="$(python3 - "${V3D_DRV}" <<'PYEOF'
+        import sys
+        path = sys.argv[1]
+        with open(path) as f:
+            text = f.read()
+        old = "\t\tif (ret)\n\t\t\tgoto err_sched;\n\n\tv3d_perfmon_open_file(v3d_priv);"
+        new = "\t\tif (ret)\n\t\t\tgoto err_sched;\n\t}\n\n\tv3d_perfmon_open_file(v3d_priv);"
+        already = "\t\tif (ret)\n\t\t\tgoto err_sched;\n\t}\n\n\tv3d_perfmon_open_file(v3d_priv);"
+        count = text.count(old)
+        if count == 1:
+            text = text.replace(old, new)
+            with open(path, "w") as f:
+                f.write(text)
+            print("PATCHED")
+        elif text.count(already) >= 1:
+            print("ALREADY_FIXED")
+        else:
+            print("NO_MATCH")
+        PYEOF
+        )"
+        echo "Patch check result: ${PYRESULT}"
+
+        if [[ "${PYRESULT}" == "PATCHED" ]]; then
+          echo "Patched: added missing '}' to close the V3D_MAX_QUEUES for-loop in v3d_open()"
+          echo
+          echo "Verifying patch applied cleanly:"
+          grep -n -A1 'goto err_sched;' "${V3D_DRV}" | head -3
+          PATCHED=1
+        elif [[ "${PYRESULT}" == "ALREADY_FIXED" ]]; then
+          echo "Source already contains the closing brace; skipping patch."
+        else
+          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
+        fi
+
+        if [[ "${PATCHED}" -eq 1 ]]; then
+          echo
+          echo "v3d_drv.c missing brace fixed successfully."
+        fi
+
     - name: Configure auraOS kernel
       shell: bash
       working-directory: ${{ github.workspace }}
@@ -1272,19 +1340,30 @@ runs:
           echo "ccache: disabled"
         fi
         echo
+        BUILD_LOG="$(mktemp)"
         echo "=== Stage 1/2: bzImage ==="
-        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" bzImage; then
+        if ! make "${COMMON_ARGS[@]}" -k -j"${JOBS}" "${VERBOSE[@]}" bzImage 2>&1 | tee "${BUILD_LOG}"; then
           echo
-          echo "bzImage failed. Retrying with -j1 V=1..."
-          make "${COMMON_ARGS[@]}" -j1 V=1 bzImage
+          echo "bzImage failed. Collecting *all* errors in one pass (make -k -j1 V=1)..."
+          make "${COMMON_ARGS[@]}" -k -j1 V=1 bzImage 2>&1 | tee -a "${BUILD_LOG}" || true
+          echo
+          echo "=============================================="
+          echo " All compiler/linker errors found this run"
+          echo "=============================================="
+          grep -nE 'error:|Error [0-9]+|undefined reference|\*\*\*' "${BUILD_LOG}" | sort -u || true
           exit 1
         fi
         echo
         echo "=== Stage 2/2: modules ==="
-        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" modules; then
+        if ! make "${COMMON_ARGS[@]}" -k -j"${JOBS}" "${VERBOSE[@]}" modules 2>&1 | tee -a "${BUILD_LOG}"; then
           echo
-          echo "modules failed. Retrying with -j1 V=1..."
-          make "${COMMON_ARGS[@]}" -j1 V=1 modules
+          echo "modules failed. Collecting *all* errors in one pass (make -k -j1 V=1)..."
+          make "${COMMON_ARGS[@]}" -k -j1 V=1 modules 2>&1 | tee -a "${BUILD_LOG}" || true
+          echo
+          echo "=============================================="
+          echo " All compiler/linker errors found this run"
+          echo "=============================================="
+          grep -nE 'error:|Error [0-9]+|undefined reference|\*\*\*' "${BUILD_LOG}" | sort -u || true
           exit 1
         fi
         echo
