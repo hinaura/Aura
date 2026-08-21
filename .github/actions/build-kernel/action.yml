@@ -480,6 +480,78 @@ runs:
           echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
         fi
 
+    - name: Fix known Ubuntu xfs/scrub build issue (missing xchk_da_set_preen)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        SCRUB_DIR="${SOURCE_DIR}/fs/xfs/scrub"
+        DABTREE_C="${SCRUB_DIR}/dabtree.c"
+        DABTREE_H="${SCRUB_DIR}/dabtree.h"
+        TRACE_H="${SCRUB_DIR}/trace.h"
+        ATTR_C="${SCRUB_DIR}/attr.c"
+        cd "${SOURCE_DIR}"
+        echo "Checking xfs/scrub for known missing xchk_da_set_preen() helper..."
+        test -f "${DABTREE_C}"
+        test -f "${DABTREE_H}"
+        test -f "${TRACE_H}"
+        test -f "${ATTR_C}"
+
+        PATCHED=0
+
+        # fs/xfs/scrub/attr.c calls xchk_da_set_preen(ds, level) to mark
+        # zero-length/nonzero-base freemap entries for preening, but this
+        # Ubuntu 6.8.0-138.138 tree never got the companion helper added to
+        # dabtree.c/.h (nor the matching xchk_fblock_preen tracepoint in
+        # trace.h) even though the call site in attr.c is present - another
+        # incomplete backport, same class of issue as the smbdirect.c fixes
+        # above. The sibling helpers xchk_block_set_preen()/xchk_ino_set_preen()
+        # already exist in common.c, and xchk_da_set_corrupt() in dabtree.c is
+        # the direct structural analog (same signature, same call sites) for
+        # the OFLAG_CORRUPT case, so we add xchk_da_set_preen() modeled
+        # exactly on it, plus the matching declaration and tracepoint. Fixes:
+        #   error: implicit declaration of function 'xchk_da_set_preen'
+        if grep -q 'xchk_da_set_preen(ds, level);' "${ATTR_C}" \
+            && ! grep -q 'xchk_da_set_preen' "${DABTREE_H}"; then
+
+          echo "Adding trace_xchk_fblock_preen tracepoint to trace.h"
+          if ! grep -q 'DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_preen);' "${TRACE_H}"; then
+            sed -i '/DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_warning);/a DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_preen);' "${TRACE_H}"
+          fi
+
+          echo "Declaring xchk_da_set_preen() in dabtree.h"
+          sed -i '/^void xchk_da_set_corrupt(struct xchk_da_btree \*ds, int level);$/a void xchk_da_set_preen(struct xchk_da_btree *ds, int level);' "${DABTREE_H}"
+
+          echo "Implementing xchk_da_set_preen() in dabtree.c"
+          if grep -q '^xchk_da_set_preen($' "${DABTREE_C}"; then
+            echo "xchk_da_set_preen() already present in dabtree.c; skipping insertion."
+          else
+            NEWFUNC=$'\n/*\n * Record da btree metadata that could be optimized. See the section\n * about handling optimizable metadata in common.c.\n */\nvoid\nxchk_da_set_preen(\n\tstruct xchk_da_btree\t*ds,\n\tint\t\t\tlevel)\n{\n\tstruct xfs_scrub\t*sc = ds->sc;\n\n\tsc->sm->sm_flags |= XFS_SCRUB_OFLAG_PREEN;\n\n\ttrace_xchk_fblock_preen(sc, ds->dargs.whichfork,\n\t\t\txfs_dir2_da_to_db(ds->dargs.geo,\n\t\t\t\tds->state->path.blk[level].blkno),\n\t\t\t__return_address);\n}'
+            awk -v newfunc="${NEWFUNC}" '
+              { print }
+              /^xchk_da_set_corrupt\($/ { infunc=1 }
+              infunc && /^}$/ { print newfunc; infunc=0 }
+            ' "${DABTREE_C}" > "${DABTREE_C}.tmp" && mv "${DABTREE_C}.tmp" "${DABTREE_C}"
+            echo "xchk_da_set_preen() inserted into dabtree.c"
+          fi
+
+          PATCHED=1
+        fi
+
+        if [[ "${PATCHED}" -eq 1 ]]; then
+          echo
+          echo "Verifying patch applied cleanly:"
+          grep -n 'DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_preen);' "${TRACE_H}"
+          grep -n 'void xchk_da_set_preen(struct xchk_da_btree \*ds, int level);' "${DABTREE_H}"
+          grep -n '^xchk_da_set_preen($' "${DABTREE_C}"
+          echo
+          echo "xfs/scrub xchk_da_set_preen() helper added successfully."
+        else
+          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
+        fi
+
     - name: Configure auraOS kernel
       shell: bash
       working-directory: ${{ github.workspace }}
