@@ -996,6 +996,8 @@ runs:
         OUTPUT_DIR="${BUILD_ROOT}/build"
         cd "${SOURCE_DIR}"
         export PATH="/usr/lib/ccache:${PATH}"
+        echo "=== Preparing build tree (generates arch/asm headers needed for M= builds) ==="
+        make O="${OUTPUT_DIR}" CC="ccache gcc" -j"$(nproc)" modules_prepare
         # These directories have needed hand-written source patches
         # (incomplete Ubuntu 6.8.0-138 backports) in earlier steps of this
         # action. Compiling just them here takes a couple of minutes instead
