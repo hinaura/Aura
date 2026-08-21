@@ -279,12 +279,15 @@ runs:
           bc bison flex libssl-dev libelf-dev libdw-dev dwarves pkg-config cpio rsync kmod \
           fakeroot dpkg-dev debhelper libncurses-dev libcap-dev libcap-ng-dev libaudit-dev \
           git curl ca-certificates xz-utils zstd bzip2 gzip openssl initramfs-tools lz4 xorriso \
-          dosfstools e2fsprogs file tar perl python3 python3-minimal
+          dosfstools e2fsprogs file tar perl python3 python3-minimal ccache
         echo
         echo "Toolchain:"
         gcc --version | head -n 1
         g++ --version | head -n 1
         make --version | head -n 1
+        ccache --version | head -n 1
+        ccache --max-size=5G
+        echo "CCACHE_DIR=$(ccache -p | grep cache_dir | awk '{print $3}')" >> "${GITHUB_ENV}"
         ld --version | head -n 1
         pahole --version || true
         openssl version
@@ -309,6 +312,14 @@ runs:
         test -f /usr/include/ncurses.h
         echo
         echo "Build dependencies check passed."
+
+    - name: Restore ccache
+      uses: actions/cache@v4
+      with:
+        path: ${{ env.CCACHE_DIR }}
+        key: auraos-ccache-${{ inputs.kernel-version }}-${{ github.run_id }}
+        restore-keys: |
+          auraos-ccache-${{ inputs.kernel-version }}-
 
     - name: Download Ubuntu Linux source
       shell: bash
@@ -548,6 +559,47 @@ runs:
           grep -n '^xchk_da_set_preen($' "${DABTREE_C}"
           echo
           echo "xfs/scrub xchk_da_set_preen() helper added successfully."
+        else
+          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
+        fi
+
+    - name: Fix known Ubuntu xfs/scrub build issue (missing xfs_attr.h include in repair.c)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        REPAIR_C="${SOURCE_DIR}/fs/xfs/scrub/repair.c"
+        cd "${SOURCE_DIR}"
+        echo "Checking fs/xfs/scrub/repair.c for missing xfs_attr.h include..."
+        test -f "${REPAIR_C}"
+
+        PATCHED=0
+
+        # fs/xfs/scrub/repair.c calls xfs_inode_hasattr(sc->ip), which is a
+        # real, correctly-declared function (fs/xfs/libxfs/xfs_attr.h,
+        # implemented in libxfs/xfs_attr.c) already used successfully
+        # elsewhere in this same tree (scrub/common.c, scrub/attr.c,
+        # xfs_attr_list.c, xfs_attr_item.c) -- every one of those files
+        # includes "xfs_attr.h", but repair.c simply never gained that
+        # #include, even though it has the call site. Same class of
+        # incomplete-backport issue as the other known fixes above, just a
+        # missing header instead of a missing symbol. Fixes:
+        #   error: implicit declaration of function 'xfs_inode_hasattr'
+        if grep -q 'xfs_inode_hasattr(sc->ip)' "${REPAIR_C}" \
+            && ! grep -q '^#include "xfs_attr.h"$' "${REPAIR_C}"; then
+          echo "Adding #include \"xfs_attr.h\" to repair.c"
+          sed -i '/^#include "xfs_reflink.h"$/i #include "xfs_attr.h"' "${REPAIR_C}"
+          PATCHED=1
+        fi
+
+        if [[ "${PATCHED}" -eq 1 ]]; then
+          echo
+          echo "Verifying patch applied cleanly:"
+          grep -n '^#include "xfs_attr.h"$' "${REPAIR_C}"
+          echo
+          echo "xfs/scrub repair.c include fix applied successfully."
         else
           echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
         fi
@@ -934,6 +986,35 @@ runs:
         echo "Kernel release:"
         make O="${OUTPUT_DIR}" -s kernelrelease
 
+    - name: Smoke-compile previously patched subsystems
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        OUTPUT_DIR="${BUILD_ROOT}/build"
+        cd "${SOURCE_DIR}"
+        export PATH="/usr/lib/ccache:${PATH}"
+        # These directories have needed hand-written source patches
+        # (incomplete Ubuntu 6.8.0-138 backports) in earlier steps of this
+        # action. Compiling just them here takes a couple of minutes instead
+        # of the ~40 for a full build, so a broken patch (or one Ubuntu has
+        # since fixed upstream, making a patch redundant/conflicting) is
+        # caught immediately instead of after the full bzImage+modules run.
+        for target in fs/smb/client fs/xfs; do
+          if [[ -d "${target}" ]]; then
+            echo "=== Smoke-compiling ${target} ==="
+            make O="${OUTPUT_DIR}" CC="ccache gcc" M="${target}" -j"$(nproc)" -k modules || {
+              echo
+              echo "ERROR: ${target} fails to compile on its own -- fix this before the full build."
+              exit 1
+            }
+          fi
+        done
+        echo
+        echo "Smoke compile of patched subsystems passed."
+
     - name: Pre-build resource check
       shell: bash
       run: |
@@ -1005,23 +1086,32 @@ runs:
         echo "Build timestamp: ${KBUILD_BUILD_TIMESTAMP}"
         echo "=============================================="
         export MAKEFLAGS="-Otarget"
-        COMMON_ARGS=(O="${OUTPUT_DIR}" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" LOCALVERSION="${LOCALVERSION}")
+        export CCACHE_DIR="${CCACHE_DIR:-${HOME}/.cache/ccache}"
+        export PATH="/usr/lib/ccache:${PATH}"
+        echo "ccache stats before build:"
+        ccache -s || true
+        COMMON_ARGS=(O="${OUTPUT_DIR}" CC="ccache gcc" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" LOCALVERSION="${LOCALVERSION}")
         echo
         echo "=== Stage 1/2: bzImage ==="
-        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" bzImage; then
+        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" -k "${VERBOSE[@]}" bzImage; then
           echo
-          echo "bzImage failed. Retrying with -j1 V=1..."
-          make "${COMMON_ARGS[@]}" -j1 V=1 bzImage
+          echo "bzImage failed (-k collected all errors above, not just the first)."
+          echo "ccache stats after failed build:"
+          ccache -s || true
           exit 1
         fi
         echo
         echo "=== Stage 2/2: modules ==="
-        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" modules; then
+        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" -k "${VERBOSE[@]}" modules; then
           echo
-          echo "modules failed. Retrying with -j1 V=1..."
-          make "${COMMON_ARGS[@]}" -j1 V=1 modules
+          echo "modules failed (-k collected all errors above, not just the first)."
+          echo "ccache stats after failed build:"
+          ccache -s || true
           exit 1
         fi
+        echo
+        echo "ccache stats after build:"
+        ccache -s || true
         echo
         echo "Kernel compilation completed."
         RELEASE="$(make O="${OUTPUT_DIR}" -s kernelrelease)"
