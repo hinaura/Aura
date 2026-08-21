@@ -279,15 +279,12 @@ runs:
           bc bison flex libssl-dev libelf-dev libdw-dev dwarves pkg-config cpio rsync kmod \
           fakeroot dpkg-dev debhelper libncurses-dev libcap-dev libcap-ng-dev libaudit-dev \
           git curl ca-certificates xz-utils zstd bzip2 gzip openssl initramfs-tools lz4 xorriso \
-          dosfstools e2fsprogs file tar perl python3 python3-minimal ccache
+          dosfstools e2fsprogs file tar perl python3 python3-minimal
         echo
         echo "Toolchain:"
         gcc --version | head -n 1
         g++ --version | head -n 1
         make --version | head -n 1
-        ccache --version | head -n 1
-        ccache --max-size=5G
-        echo "CCACHE_DIR=$(ccache -p | grep cache_dir | awk '{print $3}')" >> "${GITHUB_ENV}"
         ld --version | head -n 1
         pahole --version || true
         openssl version
@@ -312,14 +309,6 @@ runs:
         test -f /usr/include/ncurses.h
         echo
         echo "Build dependencies check passed."
-
-    - name: Restore ccache
-      uses: actions/cache@v4
-      with:
-        path: ${{ env.CCACHE_DIR }}
-        key: auraos-ccache-${{ inputs.kernel-version }}-${{ github.run_id }}
-        restore-keys: |
-          auraos-ccache-${{ inputs.kernel-version }}-
 
     - name: Download Ubuntu Linux source
       shell: bash
@@ -602,6 +591,54 @@ runs:
           echo "xfs/scrub repair.c include fix applied successfully."
         else
           echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
+        fi
+
+    - name: Fix known Ubuntu regmap KUnit backport build issue
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        REGMAP_KUNIT="${SOURCE_DIR}/drivers/base/regmap/regmap-kunit.c"
+        cd "${SOURCE_DIR}"
+        echo "Checking drivers/base/regmap/regmap-kunit.c for incomplete KUnit backport..."
+        test -f "${REGMAP_KUNIT}"
+
+        PATCHED=0
+
+        # Ubuntu's 6.8.0-138 tree can contain the newer gen_raw_regmap()
+        # implementation body (which uses the KUnit test object) without the
+        # corresponding struct kunit *test parameter and caller updates.
+        # The resulting build failure is:
+        #   error: ‘test’ undeclared (first use in this function)
+        # Upstream's fixed form takes struct kunit *test explicitly and passes
+        # it from every caller.
+        if grep -q '^static struct regmap \*gen_raw_regmap(struct regmap_config \*config,$' "${REGMAP_KUNIT}" \
+            && grep -q 'kunit_kcalloc(test,' "${REGMAP_KUNIT}"; then
+          echo "Patching gen_raw_regmap() to receive struct kunit *test"
+          sed -i \
+            's/^static struct regmap \*gen_raw_regmap(struct regmap_config \*config,$/static struct regmap *gen_raw_regmap(struct kunit *test,\n\tstruct regmap_config *config,/' \
+            "${REGMAP_KUNIT}"
+          sed -i 's/gen_raw_regmap(\&config, \&data)/gen_raw_regmap(test, \&config, \&data)/g' "${REGMAP_KUNIT}"
+          PATCHED=1
+        fi
+
+        if [[ "${PATCHED}" -eq 1 ]]; then
+          echo
+          echo "Verifying regmap KUnit patch:"
+          grep -n -A2 '^static struct regmap \*gen_raw_regmap' "${REGMAP_KUNIT}"
+          if grep -q 'gen_raw_regmap(\&config, \&data)' "${REGMAP_KUNIT}"; then
+            echo "ERROR: unpatched gen_raw_regmap() caller remains."
+            exit 1
+          fi
+          if ! grep -q 'gen_raw_regmap(test, \&config, \&data)' "${REGMAP_KUNIT}"; then
+            echo "ERROR: no patched gen_raw_regmap() caller found."
+            exit 1
+          fi
+          echo "regmap KUnit backport fix applied successfully."
+        else
+          echo "No known-broken regmap KUnit pattern found; source may already be fixed upstream."
         fi
 
     - name: Configure auraOS kernel
@@ -986,46 +1023,6 @@ runs:
         echo "Kernel release:"
         make O="${OUTPUT_DIR}" -s kernelrelease
 
-    - name: Smoke-compile previously patched subsystems
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        OUTPUT_DIR="${BUILD_ROOT}/build"
-        cd "${SOURCE_DIR}"
-        export PATH="/usr/lib/ccache:${PATH}"
-        echo "=== Preparing build tree (generates arch/asm headers needed for targeted builds) ==="
-        make O="${OUTPUT_DIR}" CC="ccache gcc" -j"$(nproc)" modules_prepare
-        # Compile only the specific object files that earlier steps in this
-        # action hand-patched, not the whole containing directory. Building
-        # a whole subdirectory via M=<dir> pulls in unrelated files (e.g.
-        # fs/smb/client/trace.c) that have their own Kbuild quirks under an
-        # isolated M= build (relative trace-header include resolution) and
-        # have nothing to do with our patches, causing false failures here.
-        # Kbuild supports building a single object by naming it directly.
-        TARGETS=(
-          fs/smb/client/smbdirect.o
-          fs/xfs/scrub/repair.o
-          fs/xfs/scrub/dabtree.o
-          fs/xfs/scrub/attr.o
-        )
-        for obj in "${TARGETS[@]}"; do
-          src="${obj%.o}.c"
-          if [[ -f "${src}" ]]; then
-            echo "=== Smoke-compiling ${obj} ==="
-            rm -f "${OUTPUT_DIR}/${obj}"
-            make O="${OUTPUT_DIR}" CC="ccache gcc" -j"$(nproc)" "${obj}" || {
-              echo
-              echo "ERROR: ${obj} fails to compile on its own -- fix this before the full build."
-              exit 1
-            }
-          fi
-        done
-        echo
-        echo "Smoke compile of patched subsystems passed."
-
     - name: Pre-build resource check
       shell: bash
       run: |
@@ -1097,32 +1094,23 @@ runs:
         echo "Build timestamp: ${KBUILD_BUILD_TIMESTAMP}"
         echo "=============================================="
         export MAKEFLAGS="-Otarget"
-        export CCACHE_DIR="${CCACHE_DIR:-${HOME}/.cache/ccache}"
-        export PATH="/usr/lib/ccache:${PATH}"
-        echo "ccache stats before build:"
-        ccache -s || true
-        COMMON_ARGS=(O="${OUTPUT_DIR}" CC="ccache gcc" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" LOCALVERSION="${LOCALVERSION}")
+        COMMON_ARGS=(O="${OUTPUT_DIR}" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" LOCALVERSION="${LOCALVERSION}")
         echo
         echo "=== Stage 1/2: bzImage ==="
-        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" -k "${VERBOSE[@]}" bzImage; then
+        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" bzImage; then
           echo
-          echo "bzImage failed (-k collected all errors above, not just the first)."
-          echo "ccache stats after failed build:"
-          ccache -s || true
+          echo "bzImage failed. Retrying with -j1 V=1..."
+          make "${COMMON_ARGS[@]}" -j1 V=1 bzImage
           exit 1
         fi
         echo
         echo "=== Stage 2/2: modules ==="
-        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" -k "${VERBOSE[@]}" modules; then
+        if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" modules; then
           echo
-          echo "modules failed (-k collected all errors above, not just the first)."
-          echo "ccache stats after failed build:"
-          ccache -s || true
+          echo "modules failed. Retrying with -j1 V=1..."
+          make "${COMMON_ARGS[@]}" -j1 V=1 modules
           exit 1
         fi
-        echo
-        echo "ccache stats after build:"
-        ccache -s || true
         echo
         echo "Kernel compilation completed."
         RELEASE="$(make O="${OUTPUT_DIR}" -s kernelrelease)"
