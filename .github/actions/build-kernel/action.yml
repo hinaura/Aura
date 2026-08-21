@@ -330,9 +330,9 @@ runs:
       with:
         path: ${{ github.workspace }}/.ccache
         key: >-
-          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles(format('{0}/action.yml', github.action_path)) }}-${{ github.run_id }}
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-${{ github.run_id }}
         restore-keys: |
-          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles(format('{0}/action.yml', github.action_path)) }}-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-
           ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-
           ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-
 
