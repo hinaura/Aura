@@ -996,20 +996,29 @@ runs:
         OUTPUT_DIR="${BUILD_ROOT}/build"
         cd "${SOURCE_DIR}"
         export PATH="/usr/lib/ccache:${PATH}"
-        echo "=== Preparing build tree (generates arch/asm headers needed for M= builds) ==="
+        echo "=== Preparing build tree (generates arch/asm headers needed for targeted builds) ==="
         make O="${OUTPUT_DIR}" CC="ccache gcc" -j"$(nproc)" modules_prepare
-        # These directories have needed hand-written source patches
-        # (incomplete Ubuntu 6.8.0-138 backports) in earlier steps of this
-        # action. Compiling just them here takes a couple of minutes instead
-        # of the ~40 for a full build, so a broken patch (or one Ubuntu has
-        # since fixed upstream, making a patch redundant/conflicting) is
-        # caught immediately instead of after the full bzImage+modules run.
-        for target in fs/smb/client fs/xfs; do
-          if [[ -d "${target}" ]]; then
-            echo "=== Smoke-compiling ${target} ==="
-            make O="${OUTPUT_DIR}" CC="ccache gcc" M="${target}" -j"$(nproc)" -k modules || {
+        # Compile only the specific object files that earlier steps in this
+        # action hand-patched, not the whole containing directory. Building
+        # a whole subdirectory via M=<dir> pulls in unrelated files (e.g.
+        # fs/smb/client/trace.c) that have their own Kbuild quirks under an
+        # isolated M= build (relative trace-header include resolution) and
+        # have nothing to do with our patches, causing false failures here.
+        # Kbuild supports building a single object by naming it directly.
+        TARGETS=(
+          fs/smb/client/smbdirect.o
+          fs/xfs/scrub/repair.o
+          fs/xfs/scrub/dabtree.o
+          fs/xfs/scrub/attr.o
+        )
+        for obj in "${TARGETS[@]}"; do
+          src="${obj%.o}.c"
+          if [[ -f "${src}" ]]; then
+            echo "=== Smoke-compiling ${obj} ==="
+            rm -f "${OUTPUT_DIR}/${obj}"
+            make O="${OUTPUT_DIR}" CC="ccache gcc" -j"$(nproc)" "${obj}" || {
               echo
-              echo "ERROR: ${target} fails to compile on its own -- fix this before the full build."
+              echo "ERROR: ${obj} fails to compile on its own -- fix this before the full build."
               exit 1
             }
           fi
