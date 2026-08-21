@@ -100,6 +100,18 @@ inputs:
     description: 'Enable verbose kernel compilation output.'
     required: false
     default: 'true'
+  ccache-enabled:
+    description: 'Cache compiled objects with ccache across runs to skip rebuilding unchanged files.'
+    required: false
+    default: 'true'
+  ccache-max-size:
+    description: 'Maximum size of the ccache cache.'
+    required: false
+    default: '5G'
+  ccache-cache-key-prefix:
+    description: 'Prefix for the actions/cache key. Bump this to force a clean cache.'
+    required: false
+    default: 'auraos-kernel-ccache-v1'
 
 runs:
   using: "composite"
@@ -279,7 +291,7 @@ runs:
           bc bison flex libssl-dev libelf-dev libdw-dev dwarves pkg-config cpio rsync kmod \
           fakeroot dpkg-dev debhelper libncurses-dev libcap-dev libcap-ng-dev libaudit-dev \
           git curl ca-certificates xz-utils zstd bzip2 gzip openssl initramfs-tools lz4 xorriso \
-          dosfstools e2fsprogs file tar perl python3 python3-minimal
+          dosfstools e2fsprogs file tar perl python3 python3-minimal ccache
         echo
         echo "Toolchain:"
         gcc --version | head -n 1
@@ -288,6 +300,7 @@ runs:
         ld --version | head -n 1
         pahole --version || true
         openssl version
+        ccache --version | head -n 1 || true
         echo
         echo "Compiler multilib test:"
         printf 'int main(void) { return 0; }\n' > /tmp/aura-test.c
@@ -309,6 +322,39 @@ runs:
         test -f /usr/include/ncurses.h
         echo
         echo "Build dependencies check passed."
+
+    - name: Restore ccache
+      if: ${{ inputs.ccache-enabled == 'true' }}
+      id: ccache-restore
+      uses: actions/cache@v4
+      with:
+        path: ${{ github.workspace }}/.ccache
+        key: >-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles(format('{0}/action.yml', github.action_path)) }}-${{ github.run_id }}
+        restore-keys: |
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles(format('{0}/action.yml', github.action_path)) }}-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-
+
+    - name: Configure ccache
+      if: ${{ inputs.ccache-enabled == 'true' }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+        mkdir -p "${CCACHE_DIR}"
+        echo "CCACHE_DIR=${CCACHE_DIR}" >> "${GITHUB_ENV}"
+        ccache --max-size="${{ inputs.ccache-max-size }}" --set-config=cache_dir="${CCACHE_DIR}"
+        # compiler_check=content makes ccache hash actual compiler bytes
+        # instead of trusting mtime, which is safer given this action
+        # patches kernel source files in place between cache hits.
+        ccache --set-config=compiler_check=content
+        ccache --zero-stats
+        echo
+        echo "ccache configuration:"
+        ccache --show-config | grep -E 'cache_dir |max_size |compiler_check '
+        echo
+        echo "Cache restored: ${{ steps.ccache-restore.outputs.cache-hit == 'true' && 'exact hit' || 'no exact hit (used restore-keys fallback or empty)' }}"
 
     - name: Download Ubuntu Linux source
       shell: bash
@@ -576,16 +622,32 @@ runs:
         # incomplete-backport issue as the other known fixes above, just a
         # missing header instead of a missing symbol. Fixes:
         #   error: implicit declaration of function 'xfs_inode_hasattr'
+        #
+        # xfs_attr.h only forward-declares "struct xfs_da_args;" -- it does
+        # NOT define it. Several of its static inline helpers (e.g.
+        # xfs_attr_init_add_state()/xfs_attr_init_remove_state()) dereference
+        # args->dp and args->op_flags, which requires the full definition of
+        # struct xfs_da_args. That full struct definition lives in
+        # xfs_da_btree.h (which itself needs xfs_da_format.h). Every other
+        # file that includes xfs_attr.h successfully (e.g. scrub/attr.c)
+        # always includes "xfs_da_format.h" and "xfs_da_btree.h" first.
+        # repair.c had neither, so adding xfs_attr.h alone left struct
+        # xfs_da_args incomplete at that point in the file, producing:
+        #   error: invalid use of undefined type 'struct xfs_da_args'
+        #   error: 'XFS_DA_OP_ADDNAME' undeclared (first use in this function)
+        # Adding the two prerequisite headers alongside xfs_attr.h fixes it.
         if grep -q 'xfs_inode_hasattr(sc->ip)' "${REPAIR_C}" \
             && ! grep -q '^#include "xfs_attr.h"$' "${REPAIR_C}"; then
-          echo "Adding #include \"xfs_attr.h\" to repair.c"
-          sed -i '/^#include "xfs_reflink.h"$/i #include "xfs_attr.h"' "${REPAIR_C}"
+          echo "Adding #include \"xfs_da_format.h\", \"xfs_da_btree.h\" and \"xfs_attr.h\" to repair.c"
+          sed -i '/^#include "xfs_reflink.h"$/i #include "xfs_da_format.h"\n#include "xfs_da_btree.h"\n#include "xfs_attr.h"' "${REPAIR_C}"
           PATCHED=1
         fi
 
         if [[ "${PATCHED}" -eq 1 ]]; then
           echo
           echo "Verifying patch applied cleanly:"
+          grep -n '^#include "xfs_da_format.h"$' "${REPAIR_C}"
+          grep -n '^#include "xfs_da_btree.h"$' "${REPAIR_C}"
           grep -n '^#include "xfs_attr.h"$' "${REPAIR_C}"
           echo
           echo "xfs/scrub repair.c include fix applied successfully."
@@ -669,6 +731,83 @@ runs:
           echo "regmap KUnit backport fix applied successfully."
         else
           echo "No known-broken regmap KUnit pattern found; source may already be fixed upstream."
+        fi
+
+    - name: Fix known Ubuntu regmap KUnit backport build issue (gen_regmap)
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      run: |
+        set -euo pipefail
+        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        REGMAP_KUNIT="${SOURCE_DIR}/drivers/base/regmap/regmap-kunit.c"
+        cd "${SOURCE_DIR}"
+        echo "Checking drivers/base/regmap/regmap-kunit.c for incomplete gen_regmap() KUnit backport..."
+        test -f "${REGMAP_KUNIT}"
+
+        PATCHED=0
+
+        # This file has two near-identical helpers: gen_raw_regmap() (fixed
+        # by the previous step) and the older, much more widely used
+        # gen_regmap() (~19 call sites). Both suffer from the exact same
+        # incomplete backport: the body of gen_regmap() references the
+        # KUnit test object via kunit_kcalloc(test, ...), but the function
+        # signature was never updated to take struct kunit *test, and none
+        # of its callers (all of which are KUnit test cases of the form
+        # "static void foo(struct kunit *test)", so `test` is always in
+        # scope at the call site) pass it in. Confirmed against the actual
+        # downloaded source: gen_raw_regmap() already had a test_type
+        # parameter to piggyback the fix onto, but gen_regmap() has no such
+        # parameter at all, so this second, distinct instance of the bug
+        # was missed by the previous step. Build failure:
+        #   error: 'test' undeclared (first use in this function)
+        if grep -q '^static struct regmap \*gen_regmap(struct regmap_config \*config,$' "${REGMAP_KUNIT}" \
+            && grep -q 'kunit_kcalloc(test,' "${REGMAP_KUNIT}"; then
+          echo "Patching gen_regmap() to receive struct kunit *test"
+          sed -i \
+            's/^static struct regmap \*gen_regmap(struct regmap_config \*config,$/static struct regmap *gen_regmap(struct kunit *test,\n\tstruct regmap_config *config,/' \
+            "${REGMAP_KUNIT}"
+
+          # Every caller currently reads "gen_regmap(&config, &data)". Add
+          # test to each one. The (already-patched) gen_raw_regmap() callers
+          # use a distinct "gen_raw_regmap(test, &config, ..." spelling, so
+          # this plain substring match cannot collide with them.
+          BEFORE_CALLS="$(grep -Ec 'gen_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
+          if [[ "${BEFORE_CALLS}" -eq 0 ]]; then
+            echo "ERROR: expected gen_regmap(&config, ...) callers were not found."
+            exit 1
+          fi
+          sed -i 's/gen_regmap(&config,/gen_regmap(test, \&config,/g' "${REGMAP_KUNIT}"
+          PATCHED=1
+        fi
+
+        if [[ "${PATCHED}" -eq 1 ]]; then
+          echo
+          echo "Verifying regmap KUnit gen_regmap() patch:"
+          grep -n -A2 '^static struct regmap \*gen_regmap' "${REGMAP_KUNIT}"
+
+          if ! grep -q '^static struct regmap \*gen_regmap(struct kunit \*test,$' "${REGMAP_KUNIT}"; then
+            echo "ERROR: gen_regmap() signature was not patched correctly."
+            exit 1
+          fi
+
+          REMAINING="$(grep -Ec 'gen_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
+          if [[ "${REMAINING}" -ne 0 ]]; then
+            echo "ERROR: ${REMAINING} unpatched gen_regmap() caller(s) remain."
+            grep -n 'gen_regmap(' "${REGMAP_KUNIT}"
+            exit 1
+          fi
+
+          PATCHED_CALLS="$(grep -Ec 'gen_regmap\(test, &config,' "${REGMAP_KUNIT}" || true)"
+          if [[ "${PATCHED_CALLS}" -eq 0 ]]; then
+            echo "ERROR: no patched gen_regmap() callers found."
+            exit 1
+          fi
+
+          echo "Patched ${PATCHED_CALLS} gen_regmap() caller(s)."
+          echo "regmap KUnit gen_regmap() backport fix applied successfully."
+        else
+          echo "No known-broken gen_regmap() pattern found; source may already be fixed upstream."
         fi
 
     - name: Configure auraOS kernel
@@ -1091,6 +1230,7 @@ runs:
         KBUILD_BUILD_VERSION: ${{ inputs.kernel-build-version }}
         LOCALVERSION: ${{ inputs.kernel-localversion }}
         SOURCE_DATE_EPOCH: '1787184000'
+        CCACHE_DIR: ${{ github.workspace }}/.ccache
       run: |
         set -euo pipefail
         BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
@@ -1125,6 +1265,12 @@ runs:
         echo "=============================================="
         export MAKEFLAGS="-Otarget"
         COMMON_ARGS=(O="${OUTPUT_DIR}" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" LOCALVERSION="${LOCALVERSION}")
+        if [[ "${{ inputs.ccache-enabled }}" == "true" ]] && command -v ccache >/dev/null 2>&1; then
+          echo "ccache: enabled (CCACHE_DIR=${CCACHE_DIR:-unset})"
+          COMMON_ARGS+=(CC="ccache gcc" HOSTCC="ccache gcc")
+        else
+          echo "ccache: disabled"
+        fi
         echo
         echo "=== Stage 1/2: bzImage ==="
         if ! make "${COMMON_ARGS[@]}" -j"${JOBS}" "${VERBOSE[@]}" bzImage; then
@@ -1152,6 +1298,12 @@ runs:
         ls -lh "${OUTPUT_DIR}/arch/x86/boot/bzImage"
         test -s "${OUTPUT_DIR}/arch/x86/boot/bzImage"
         test -f "${OUTPUT_DIR}/System.map"
+        if [[ "${{ inputs.ccache-enabled }}" == "true" ]] && command -v ccache >/dev/null 2>&1; then
+          echo
+          echo "ccache stats:"
+          ccache --show-stats
+          du -sh "${CCACHE_DIR}" 2>/dev/null || true
+        fi
 
     - name: Verify built kernel configuration
       shell: bash
