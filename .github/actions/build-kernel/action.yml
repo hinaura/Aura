@@ -845,7 +845,6 @@ runs:
         KBUILD_BUILD_HOST: ${{ inputs.kernel-build-host }}
         KBUILD_BUILD_TIMESTAMP: ${{ inputs.kernel-build-timestamp }}
         KBUILD_BUILD_VERSION: ${{ inputs.kernel-build-version }}
-        LOCALVERSION: ${{ inputs.kernel-localversion }}
         SOURCE_DATE_EPOCH: '1787184000'
         CCACHE_DIR: ${{ env.AURA_BUILD_ROOT }}/.ccache
       run: |
@@ -871,7 +870,7 @@ runs:
         echo " Building auraOS Linux kernel (vanilla ${{ inputs.kernel-version }})"
         echo "=============================================="
         echo "Kernel version:  ${{ inputs.kernel-version }}"
-        echo "Local version:   ${LOCALVERSION}"
+        echo "Local version:   ${{ inputs.kernel-localversion }}"
         echo "Jobs:            ${JOBS}"
         echo "CPU count:       ${CPU_COUNT}"
         echo "Architecture:    $(uname -m)"
@@ -881,7 +880,7 @@ runs:
         echo "Build timestamp: ${KBUILD_BUILD_TIMESTAMP}"
         echo "=============================================="
         export MAKEFLAGS="-Otarget"
-        COMMON_ARGS=(O="${OUTPUT_DIR}" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}" LOCALVERSION="${LOCALVERSION}")
+        COMMON_ARGS=(O="${OUTPUT_DIR}" KBUILD_BUILD_USER="${KBUILD_BUILD_USER}" KBUILD_BUILD_HOST="${KBUILD_BUILD_HOST}" KBUILD_BUILD_VERSION="${KBUILD_BUILD_VERSION}" KBUILD_BUILD_TIMESTAMP="${KBUILD_BUILD_TIMESTAMP}")
         if [[ "${{ inputs.ccache-enabled }}" == "true" ]] && command -v ccache >/dev/null 2>&1; then
           echo "ccache: enabled (CCACHE_DIR=${CCACHE_DIR:-unset})"
           COMMON_ARGS+=(CC="ccache gcc" HOSTCC="ccache gcc")
