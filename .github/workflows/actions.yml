@@ -1,3 +1,5 @@
+actions.yml
+
 name: Publish auraOS Release
 
 on:
@@ -14,10 +16,11 @@ permissions:
 
 jobs:
   publish:
+    name: Publish Release
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download artifact from latest successful build
+      - name: Download latest successful build
         uses: dawidd6/action-download-artifact@v11
         with:
           workflow: release.yml
@@ -26,15 +29,18 @@ jobs:
           path: ./release
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check downloaded file
+      - name: Check downloaded files
         run: |
           ls -lh ./release
-          test -f ./release/auraOS-linux-6.12.104-generic.zip
+          test -f ./release/auraOS-kernel-6.12.104-generic-auraOS-x86_64.tar.gz
+          test -f ./release/auraOS-kernel-6.12.104-generic-auraOS-x86_64.tar.gz.sha256
 
-      - name: Create Release
+      - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
           name: auraOS ${{ inputs.tag }}
-          files: ./release/auraOS-linux-6.12.104-generic.zip
+          files: |
+            ./release/auraOS-kernel-6.12.104-generic-auraOS-x86_64.tar.gz
+            ./release/auraOS-kernel-6.12.104-generic-auraOS-x86_64.tar.gz.sha256
           generate_release_notes: true
