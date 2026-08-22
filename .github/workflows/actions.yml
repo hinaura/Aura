@@ -8,23 +8,17 @@ on:
         required: true
         default: "v1.0.0"
 
-      name:
-        description: "Release name"
-        required: true
-        default: "auraOS Release"
-
 permissions:
-  contents: write
   actions: read
+  contents: write
 
 jobs:
   publish:
-    name: Publish Release
     runs-on: ubuntu-latest
 
     steps:
-      - name: Download latest successful build
-        uses: dawidd6/action-download-artifact@v23
+      - name: Download artifact from latest successful build
+        uses: dawidd6/action-download-artifact@v11
         with:
           workflow: release.yml
           workflow_conclusion: success
@@ -32,10 +26,15 @@ jobs:
           path: ./release
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Publish GitHub Release
+      - name: Check downloaded file
+        run: |
+          ls -lh ./release
+          test -f ./release/auraOS-linux-6.12.104-generic.zip
+
+      - name: Create Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
-          name: ${{ inputs.name }}
+          name: auraOS ${{ inputs.tag }}
           files: ./release/auraOS-linux-6.12.104-generic.zip
           generate_release_notes: true
