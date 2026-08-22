@@ -1,5 +1,5 @@
-name: 'Maximize build disk space and build auraOS kernel'
-description: 'Maximize build disk space, download Ubuntu Linux 6.8 source, configure a broad x86_64 kernel, build it with diagnostics, and package the result'
+name: 'Maximize build disk space and build auraOS kernel (vanilla)'
+description: 'Maximize build disk space, download vanilla Linux 6.12 LTS source from kernel.org, configure a broad x86_64 kernel, build it with diagnostics, and package the result'
 branding:
   icon: 'cpu'
   color: 'orange'
@@ -57,13 +57,13 @@ inputs:
     required: false
     default: 'true'
   kernel-version:
-    description: 'Ubuntu kernel source version.'
+    description: 'Vanilla kernel.org version to build (full x.y.z, e.g. 6.12.104).'
     required: false
-    default: '6.8.0-138'
-  kernel-source-revision:
-    description: 'Ubuntu source package revision.'
+    default: '6.12.104'
+  kernel-series:
+    description: 'Kernel major.minor series used to build the kernel.org download URL (e.g. 6.x, 5.x).'
     required: false
-    default: '6.8.0-138.138'
+    default: '6.x'
   kernel-localversion:
     description: 'Additional local version appended to the kernel release.'
     required: false
@@ -111,7 +111,7 @@ inputs:
   ccache-cache-key-prefix:
     description: 'Prefix for the actions/cache key. Bump this to force a clean cache.'
     required: false
-    default: 'auraos-kernel-ccache-v1'
+    default: 'auraos-kernel-ccache-vanilla-v1'
 
 runs:
   using: "composite"
@@ -121,7 +121,7 @@ runs:
       run: |
         set -euo pipefail
         echo "=============================================="
-        echo " auraOS kernel build environment"
+        echo " auraOS kernel build environment (vanilla)"
         echo "=============================================="
         echo
         echo "Runner:"
@@ -290,7 +290,7 @@ runs:
           build-essential gcc g++ gcc-multilib g++-multilib libc6-dev libc6-dev-i386 \
           bc bison flex libssl-dev libelf-dev libdw-dev dwarves pkg-config cpio rsync kmod \
           fakeroot dpkg-dev debhelper libncurses-dev libcap-dev libcap-ng-dev libaudit-dev \
-          git curl ca-certificates xz-utils zstd bzip2 gzip openssl initramfs-tools lz4 xorriso \
+          git curl ca-certificates gnupg xz-utils zstd bzip2 gzip openssl initramfs-tools lz4 xorriso \
           dosfstools e2fsprogs file tar perl python3 python3-minimal ccache
         echo
         echo "Toolchain:"
@@ -311,7 +311,7 @@ runs:
         rm -f /tmp/aura-test.c /tmp/aura-test32 /tmp/aura-test64
         echo
         echo "Required binaries:"
-        for tool in gcc g++ make ld as ar nm objcopy strip bc flex bison perl rsync depmod mkinitramfs dpkg-deb curl tar zstd lz4 python3; do
+        for tool in gcc g++ make ld as ar nm objcopy strip bc flex bison perl rsync depmod mkinitramfs curl gpg tar zstd lz4 python3; do
           if ! command -v "${tool}" >/dev/null 2>&1; then
             echo "ERROR: Required tool not found: ${tool}"
             exit 1
@@ -330,11 +330,11 @@ runs:
       with:
         path: ${{ github.workspace }}/.ccache
         key: >-
-          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-${{ github.run_id }}
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-${{ github.run_id }}
         restore-keys: |
-          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-
-          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-
-          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-source-revision }}-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-
+          ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-
 
     - name: Configure ccache
       if: ${{ inputs.ccache-enabled == 'true' }}
@@ -345,9 +345,6 @@ runs:
         mkdir -p "${CCACHE_DIR}"
         echo "CCACHE_DIR=${CCACHE_DIR}" >> "${GITHUB_ENV}"
         ccache --max-size="${{ inputs.ccache-max-size }}" --set-config=cache_dir="${CCACHE_DIR}"
-        # compiler_check=content makes ccache hash actual compiler bytes
-        # instead of trusting mtime, which is safer given this action
-        # patches kernel source files in place between cache hits.
         ccache --set-config=compiler_check=content
         ccache --zero-stats
         echo
@@ -356,70 +353,59 @@ runs:
         echo
         echo "Cache restored: ${{ steps.ccache-restore.outputs.cache-hit == 'true' && 'exact hit' || 'no exact hit (used restore-keys fallback or empty)' }}"
 
-    - name: Download Ubuntu Linux source
+    - name: Download vanilla Linux source from kernel.org
       shell: bash
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
         BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        SOURCE_DEB="${BUILD_ROOT}/linux-source-${{ inputs.kernel-version }}_${{ inputs.kernel-source-revision }}_all.deb"
+        TARBALL="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}.tar.xz"
+        SIGN="${TARBALL}.sign"
         mkdir -p "${BUILD_ROOT}"
+
+        # kernel.org's own mirror list, tried in order.
         URLS=(
-          "https://ppa.launchpadcontent.net/canonical-kernel-team/ppa2/ubuntu/pool/main/l/linux/linux-source-6.8.0_${{ inputs.kernel-source-revision }}_all.deb"
-          "https://archive.ubuntu.com/ubuntu/pool/main/l/linux/linux-source-6.8.0_${{ inputs.kernel-source-revision }}_all.deb"
-          "https://security.ubuntu.com/ubuntu/pool/main/l/linux/linux-source-6.8.0_${{ inputs.kernel-source-revision }}_all.deb"
-          "https://ftp.rz.uni-wuerzburg.de/ubuntu/pool/main/l/linux/linux-source-6.8.0_${{ inputs.kernel-source-revision }}_all.deb"
+          "https://cdn.kernel.org/pub/linux/kernel/v${{ inputs.kernel-series }}/linux-${{ inputs.kernel-version }}.tar.xz"
+          "https://mirrors.edge.kernel.org/pub/linux/kernel/v${{ inputs.kernel-series }}/linux-${{ inputs.kernel-version }}.tar.xz"
+          "https://www.kernel.org/pub/linux/kernel/v${{ inputs.kernel-series }}/linux-${{ inputs.kernel-version }}.tar.xz"
         )
         downloaded="false"
         for url in "${URLS[@]}"; do
           echo
           echo "Trying:"
           echo "  ${url}"
-          rm -f "${SOURCE_DEB}.part"
-          if curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 1200 -o "${SOURCE_DEB}.part" "${url}"; then
-            if [[ -s "${SOURCE_DEB}.part" ]]; then
-              mv "${SOURCE_DEB}.part" "${SOURCE_DEB}"
+          rm -f "${TARBALL}.part"
+          if curl --fail --location --retry 5 --retry-all-errors --retry-delay 2 --connect-timeout 20 --max-time 1800 -o "${TARBALL}.part" "${url}"; then
+            if [[ -s "${TARBALL}.part" ]]; then
+              mv "${TARBALL}.part" "${TARBALL}"
               downloaded="true"
               break
             fi
-            rm -f "${SOURCE_DEB}.part"
+            rm -f "${TARBALL}.part"
           fi
         done
         if [[ "${downloaded}" != "true" ]]; then
           echo
-          echo "ERROR: Failed to download Ubuntu Linux source."
+          echo "ERROR: Failed to download vanilla Linux source from kernel.org."
           exit 1
         fi
         echo
-        echo "Downloaded source package:"
-        ls -lh "${SOURCE_DEB}"
+        echo "Downloaded source tarball:"
+        ls -lh "${TARBALL}"
+
         echo
-        echo "Checking Debian package:"
-        dpkg-deb --info "${SOURCE_DEB}" | head -100
+        echo "Fetching kernel.org detached signature (best-effort, informational only)..."
+        curl --fail --location --retry 3 --retry-delay 2 --connect-timeout 20 --max-time 120 \
+          -o "${SIGN}" \
+          "https://cdn.kernel.org/pub/linux/kernel/v${{ inputs.kernel-series }}/linux-${{ inputs.kernel-version }}.tar.sign" || true
+
         echo
-        echo "Checking package contents:"
-        if ! dpkg-deb --contents "${SOURCE_DEB}" | grep -E 'linux-source-6\.8\.0\.tar\.(bz2|xz|zst)$' | head -20; then
-          echo "ERROR: Expected Linux 6.8 source archive was not found in the package."
-          exit 1
-        fi
-        echo
-        echo "Extracting source package..."
-        rm -rf "${BUILD_ROOT}/source-package" "${SOURCE_DIR}"
-        mkdir -p "${BUILD_ROOT}/source-package" "${SOURCE_DIR}"
-        dpkg-deb -x "${SOURCE_DEB}" "${BUILD_ROOT}/source-package"
-        SOURCE_TARBALL="$(find "${BUILD_ROOT}/source-package" -type f \( -name "linux-source-6.8.0.tar.bz2" -o -name "linux-source-6.8.0.tar.xz" -o -name "linux-source-6.8.0.tar.zst" \) | head -n 1)"
-        if [[ -z "${SOURCE_TARBALL}" ]]; then
-          echo "ERROR: Kernel source archive not found."
-          find "${BUILD_ROOT}/source-package" -type f | head -100
-          exit 1
-        fi
-        case "${SOURCE_TARBALL}" in
-          *.tar.bz2) tar -xjf "${SOURCE_TARBALL}" --strip-components=1 -C "${SOURCE_DIR}" ;;
-          *.tar.xz) tar -xJf "${SOURCE_TARBALL}" --strip-components=1 -C "${SOURCE_DIR}" ;;
-          *.tar.zst) tar --zstd -xf "${SOURCE_TARBALL}" --strip-components=1 -C "${SOURCE_DIR}" ;;
-          *) echo "ERROR: Unsupported archive: ${SOURCE_TARBALL}"; exit 1 ;;
-        esac
+        echo "Extracting source..."
+        rm -rf "${SOURCE_DIR}"
+        mkdir -p "${SOURCE_DIR}"
+        tar -xJf "${TARBALL}" --strip-components=1 -C "${SOURCE_DIR}"
+
         test -f "${SOURCE_DIR}/Makefile"
         test -f "${SOURCE_DIR}/Kconfig"
         test -d "${SOURCE_DIR}/drivers"
@@ -432,451 +418,11 @@ runs:
         echo "Kernel version reported by source:"
         make -C "${SOURCE_DIR}" kernelversion
         ACTUAL_BASE_VERSION="$(make -C "${SOURCE_DIR}" -s kernelversion)"
+        EXPECTED_MAJOR_MINOR="$(echo "${{ inputs.kernel-version }}" | cut -d. -f1-2)"
         case "${ACTUAL_BASE_VERSION}" in
-          6.8.*) ;;
-          *) echo "ERROR: Expected Linux 6.8 source, got: ${ACTUAL_BASE_VERSION}"; exit 1 ;;
+          ${EXPECTED_MAJOR_MINOR}*) ;;
+          *) echo "ERROR: Expected Linux ${EXPECTED_MAJOR_MINOR} source, got: ${ACTUAL_BASE_VERSION}"; exit 1 ;;
         esac
-
-    - name: Check known Ubuntu AppArmor build issue
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        cd "${SOURCE_DIR}"
-        echo "Checking AppArmor source for the known incompatible symbol..."
-        if grep -R -n --include='*.c' 'spin_is_lock' security/apparmor 2>/dev/null; then
-          echo
-          echo "AppArmor contains spin_is_lock()."
-          echo "CONFIG_SECURITY_APPARMOR will be forced to n."
-        fi
-        echo
-        echo "RCU list API references:"
-        grep -n 'list_for_each_entry_rcu' include/linux/rculist.h | head -10 || true
-
-    - name: Fix known Ubuntu cifs/smbdirect.c build issue
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        SMBDIRECT="${SOURCE_DIR}/fs/smb/client/smbdirect.c"
-        cd "${SOURCE_DIR}"
-        echo "Checking cifs/smbdirect.c for known Ubuntu 6.8.0-138 backport breakage..."
-        test -f "${SMBDIRECT}"
-
-        PATCHED=0
-
-        # 1) smbd_post_send_iter() references an undeclared 'sp' pointer.
-        #    Upstream later introduced a "peer socket parameters" struct
-        #    (smbdirect_socket_parameters, accessed as sc->parameters via a
-        #    local 'sp' shortcut) as part of a much larger 2026 smbdirect
-        #    refactor ("smb: common: introduce and use common smbdirect
-        #    headers/structures"), and a follow-up commit ("smb: client: let
-        #    smbd_post_send_iter() respect the peers max_send_size and
-        #    transmit all data") switched this one line to use it.
-        #    That struct/field does NOT exist anywhere in this 6.8.0-138.138
-        #    tree (confirmed: fs/smb/common/smbdirect/smbdirect_socket.h here
-        #    has no "parameters" member at all), so Ubuntu's backport of that
-        #    later commit is incomplete/inapplicable to this kernel version.
-        #    In this tree the negotiated send size is simply
-        #    smbd_connection::max_send_size (i.e. 'info->max_send_size'),
-        #    which is exactly what every other line in this function already
-        #    uses. Realigning this line to match fixes:
-        #      error: 'sp' undeclared (first use in this function)
-        if grep -q 'sp->max_send_size - sizeof(\*packet));' "${SMBDIRECT}"; then
-          echo "Patching: sp->max_send_size -> info->max_send_size"
-          sed -i 's/sp->max_send_size - sizeof(\*packet));/info->max_send_size - sizeof(*packet));/' "${SMBDIRECT}"
-          PATCHED=1
-        fi
-
-        # 2) smbd_destroy() calls disable_work_sync(), which was added to the
-        #    kernel workqueue API by Tejun Heo's "workqueue: Implement
-        #    disable/enable_work()" series, merged for v6.10 (2024) - i.e.
-        #    strictly newer than this 6.8.0 tree, whose
-        #    include/linux/workqueue.h only declares cancel_work_sync()
-        #    (confirmed by grep against the actual downloaded source).
-        #    cancel_work_sync() is already used elsewhere in this same file
-        #    for the equivalent teardown purpose, so use it here too. Fixes:
-        #      error: implicit declaration of function 'disable_work_sync'
-        if grep -q 'disable_work_sync(&info->post_send_credits_work);' "${SMBDIRECT}"; then
-          echo "Patching: disable_work_sync() -> cancel_work_sync()"
-          sed -i 's/disable_work_sync(&info->post_send_credits_work);/cancel_work_sync(\&info->post_send_credits_work);/' "${SMBDIRECT}"
-          PATCHED=1
-        fi
-
-        if [[ "${PATCHED}" -eq 1 ]]; then
-          echo
-          echo "Verifying patch applied cleanly:"
-          grep -n 'info->max_send_size - sizeof(\*packet));' "${SMBDIRECT}"
-          grep -n 'cancel_work_sync(&info->post_send_credits_work);' "${SMBDIRECT}"
-          if grep -q '\bsp->max_send_size\b' "${SMBDIRECT}"; then
-            echo "ERROR: stray 'sp->max_send_size' reference remains after patching."
-            exit 1
-          fi
-          if grep -q 'disable_work_sync(' "${SMBDIRECT}"; then
-            echo "ERROR: stray 'disable_work_sync(' reference remains after patching."
-            exit 1
-          fi
-          echo
-          echo "cifs/smbdirect.c patched successfully."
-        else
-          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
-        fi
-
-    - name: Fix known Ubuntu xfs/scrub build issue (missing xchk_da_set_preen)
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        SCRUB_DIR="${SOURCE_DIR}/fs/xfs/scrub"
-        DABTREE_C="${SCRUB_DIR}/dabtree.c"
-        DABTREE_H="${SCRUB_DIR}/dabtree.h"
-        TRACE_H="${SCRUB_DIR}/trace.h"
-        ATTR_C="${SCRUB_DIR}/attr.c"
-        cd "${SOURCE_DIR}"
-        echo "Checking xfs/scrub for known missing xchk_da_set_preen() helper..."
-        test -f "${DABTREE_C}"
-        test -f "${DABTREE_H}"
-        test -f "${TRACE_H}"
-        test -f "${ATTR_C}"
-
-        PATCHED=0
-
-        # fs/xfs/scrub/attr.c calls xchk_da_set_preen(ds, level) to mark
-        # zero-length/nonzero-base freemap entries for preening, but this
-        # Ubuntu 6.8.0-138.138 tree never got the companion helper added to
-        # dabtree.c/.h (nor the matching xchk_fblock_preen tracepoint in
-        # trace.h) even though the call site in attr.c is present - another
-        # incomplete backport, same class of issue as the smbdirect.c fixes
-        # above. The sibling helpers xchk_block_set_preen()/xchk_ino_set_preen()
-        # already exist in common.c, and xchk_da_set_corrupt() in dabtree.c is
-        # the direct structural analog (same signature, same call sites) for
-        # the OFLAG_CORRUPT case, so we add xchk_da_set_preen() modeled
-        # exactly on it, plus the matching declaration and tracepoint. Fixes:
-        #   error: implicit declaration of function 'xchk_da_set_preen'
-        if grep -q 'xchk_da_set_preen(ds, level);' "${ATTR_C}" \
-            && ! grep -q 'xchk_da_set_preen' "${DABTREE_H}"; then
-
-          echo "Adding trace_xchk_fblock_preen tracepoint to trace.h"
-          if ! grep -q 'DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_preen);' "${TRACE_H}"; then
-            sed -i '/DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_warning);/a DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_preen);' "${TRACE_H}"
-          fi
-
-          echo "Declaring xchk_da_set_preen() in dabtree.h"
-          sed -i '/^void xchk_da_set_corrupt(struct xchk_da_btree \*ds, int level);$/a void xchk_da_set_preen(struct xchk_da_btree *ds, int level);' "${DABTREE_H}"
-
-          echo "Implementing xchk_da_set_preen() in dabtree.c"
-          if grep -q '^xchk_da_set_preen($' "${DABTREE_C}"; then
-            echo "xchk_da_set_preen() already present in dabtree.c; skipping insertion."
-          else
-            NEWFUNC=$'\n/*\n * Record da btree metadata that could be optimized. See the section\n * about handling optimizable metadata in common.c.\n */\nvoid\nxchk_da_set_preen(\n\tstruct xchk_da_btree\t*ds,\n\tint\t\t\tlevel)\n{\n\tstruct xfs_scrub\t*sc = ds->sc;\n\n\tsc->sm->sm_flags |= XFS_SCRUB_OFLAG_PREEN;\n\n\ttrace_xchk_fblock_preen(sc, ds->dargs.whichfork,\n\t\t\txfs_dir2_da_to_db(ds->dargs.geo,\n\t\t\t\tds->state->path.blk[level].blkno),\n\t\t\t__return_address);\n}'
-            awk -v newfunc="${NEWFUNC}" '
-              { print }
-              /^xchk_da_set_corrupt\($/ { infunc=1 }
-              infunc && /^}$/ { print newfunc; infunc=0 }
-            ' "${DABTREE_C}" > "${DABTREE_C}.tmp" && mv "${DABTREE_C}.tmp" "${DABTREE_C}"
-            echo "xchk_da_set_preen() inserted into dabtree.c"
-          fi
-
-          PATCHED=1
-        fi
-
-        if [[ "${PATCHED}" -eq 1 ]]; then
-          echo
-          echo "Verifying patch applied cleanly:"
-          grep -n 'DEFINE_SCRUB_FBLOCK_ERROR_EVENT(xchk_fblock_preen);' "${TRACE_H}"
-          grep -n 'void xchk_da_set_preen(struct xchk_da_btree \*ds, int level);' "${DABTREE_H}"
-          grep -n '^xchk_da_set_preen($' "${DABTREE_C}"
-          echo
-          echo "xfs/scrub xchk_da_set_preen() helper added successfully."
-        else
-          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
-        fi
-
-    - name: Fix known Ubuntu xfs/scrub build issue (missing xfs_attr.h include in repair.c)
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        REPAIR_C="${SOURCE_DIR}/fs/xfs/scrub/repair.c"
-        cd "${SOURCE_DIR}"
-        echo "Checking fs/xfs/scrub/repair.c for missing xfs_attr.h include..."
-        test -f "${REPAIR_C}"
-
-        PATCHED=0
-
-        # fs/xfs/scrub/repair.c calls xfs_inode_hasattr(sc->ip), which is a
-        # real, correctly-declared function (fs/xfs/libxfs/xfs_attr.h,
-        # implemented in libxfs/xfs_attr.c) already used successfully
-        # elsewhere in this same tree (scrub/common.c, scrub/attr.c,
-        # xfs_attr_list.c, xfs_attr_item.c) -- every one of those files
-        # includes "xfs_attr.h", but repair.c simply never gained that
-        # #include, even though it has the call site. Same class of
-        # incomplete-backport issue as the other known fixes above, just a
-        # missing header instead of a missing symbol. Fixes:
-        #   error: implicit declaration of function 'xfs_inode_hasattr'
-        #
-        # xfs_attr.h only forward-declares "struct xfs_da_args;" -- it does
-        # NOT define it. Several of its static inline helpers (e.g.
-        # xfs_attr_init_add_state()/xfs_attr_init_remove_state()) dereference
-        # args->dp and args->op_flags, which requires the full definition of
-        # struct xfs_da_args. That full struct definition lives in
-        # xfs_da_btree.h (which itself needs xfs_da_format.h). Every other
-        # file that includes xfs_attr.h successfully (e.g. scrub/attr.c)
-        # always includes "xfs_da_format.h" and "xfs_da_btree.h" first.
-        # repair.c had neither, so adding xfs_attr.h alone left struct
-        # xfs_da_args incomplete at that point in the file, producing:
-        #   error: invalid use of undefined type 'struct xfs_da_args'
-        #   error: 'XFS_DA_OP_ADDNAME' undeclared (first use in this function)
-        # Adding the two prerequisite headers alongside xfs_attr.h fixes it.
-        if grep -q 'xfs_inode_hasattr(sc->ip)' "${REPAIR_C}" \
-            && ! grep -q '^#include "xfs_attr.h"$' "${REPAIR_C}"; then
-          echo "Adding #include \"xfs_da_format.h\", \"xfs_da_btree.h\" and \"xfs_attr.h\" to repair.c"
-          sed -i '/^#include "xfs_reflink.h"$/i #include "xfs_da_format.h"\n#include "xfs_da_btree.h"\n#include "xfs_attr.h"' "${REPAIR_C}"
-          PATCHED=1
-        fi
-
-        if [[ "${PATCHED}" -eq 1 ]]; then
-          echo
-          echo "Verifying patch applied cleanly:"
-          grep -n '^#include "xfs_da_format.h"$' "${REPAIR_C}"
-          grep -n '^#include "xfs_da_btree.h"$' "${REPAIR_C}"
-          grep -n '^#include "xfs_attr.h"$' "${REPAIR_C}"
-          echo
-          echo "xfs/scrub repair.c include fix applied successfully."
-        else
-          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
-        fi
-
-    - name: Fix known Ubuntu regmap KUnit backport build issue
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        REGMAP_KUNIT="${SOURCE_DIR}/drivers/base/regmap/regmap-kunit.c"
-        cd "${SOURCE_DIR}"
-        echo "Checking drivers/base/regmap/regmap-kunit.c for incomplete KUnit backport..."
-        test -f "${REGMAP_KUNIT}"
-
-        PATCHED=0
-
-        # Ubuntu's 6.8.0-138 tree can contain the newer gen_raw_regmap()
-        # implementation body, which uses the KUnit test object, without
-        # the corresponding struct kunit *test parameter and caller updates.
-        # The resulting build failure is:
-        #   error: 'test' undeclared (first use in this function)
-        # Upstream's fixed form passes struct kunit *test explicitly from
-        # every caller. In this Ubuntu tree gen_raw_regmap() still has the
-        # older raw_test_types *test_type argument, so retain that argument
-        # and add only the missing KUnit test parameter.
-        if grep -q '^static struct regmap \*gen_raw_regmap(struct regmap_config \*config,$' "${REGMAP_KUNIT}" \
-            && grep -q 'kunit_kcalloc(test,' "${REGMAP_KUNIT}"; then
-          echo "Patching gen_raw_regmap() to receive struct kunit *test"
-          sed -i \
-            's/^static struct regmap \*gen_raw_regmap(struct regmap_config \*config,$/static struct regmap *gen_raw_regmap(struct kunit *test,\n\tstruct regmap_config *config,/' \
-            "${REGMAP_KUNIT}"
-
-          # This source revision still calls the helper as:
-          #   gen_raw_regmap(&config, t, &data)
-          # Add test to every such caller. Do not match the function
-          # declaration because it does not contain &config.
-          BEFORE_CALLS="$(grep -Ec 'gen_raw_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
-          if [[ "${BEFORE_CALLS}" -eq 0 ]]; then
-            echo "ERROR: expected gen_raw_regmap(&config, ...) callers were not found."
-            exit 1
-          fi
-          sed -i 's/gen_raw_regmap(&config,/gen_raw_regmap(test, \&config,/g' "${REGMAP_KUNIT}"
-          PATCHED=1
-        fi
-
-        if [[ "${PATCHED}" -eq 1 ]]; then
-          echo
-          echo "Verifying regmap KUnit patch:"
-          grep -n -A3 '^static struct regmap \*gen_raw_regmap' "${REGMAP_KUNIT}"
-
-          # The helper must have the new test parameter while retaining the
-          # existing raw_test_types parameter.
-          if ! grep -q '^static struct regmap \*gen_raw_regmap(struct kunit \*test,$' "${REGMAP_KUNIT}"; then
-            echo "ERROR: gen_raw_regmap() signature was not patched correctly."
-            exit 1
-          fi
-          if ! grep -q 'struct raw_test_types \*test_type,' "${REGMAP_KUNIT}"; then
-            echo "ERROR: existing raw_test_types parameter was unexpectedly lost."
-            exit 1
-          fi
-
-          REMAINING="$(grep -Ec 'gen_raw_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
-          if [[ "${REMAINING}" -ne 0 ]]; then
-            echo "ERROR: ${REMAINING} unpatched gen_raw_regmap() caller(s) remain."
-            grep -n 'gen_raw_regmap(' "${REGMAP_KUNIT}"
-            exit 1
-          fi
-
-          PATCHED_CALLS="$(grep -Ec 'gen_raw_regmap\(test, &config,' "${REGMAP_KUNIT}" || true)"
-          if [[ "${PATCHED_CALLS}" -eq 0 ]]; then
-            echo "ERROR: no patched gen_raw_regmap() callers found."
-            exit 1
-          fi
-
-          echo "Patched ${PATCHED_CALLS} gen_raw_regmap() caller(s)."
-          echo "regmap KUnit backport fix applied successfully."
-        else
-          echo "No known-broken regmap KUnit pattern found; source may already be fixed upstream."
-        fi
-
-    - name: Fix known Ubuntu regmap KUnit backport build issue (gen_regmap)
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        REGMAP_KUNIT="${SOURCE_DIR}/drivers/base/regmap/regmap-kunit.c"
-        cd "${SOURCE_DIR}"
-        echo "Checking drivers/base/regmap/regmap-kunit.c for incomplete gen_regmap() KUnit backport..."
-        test -f "${REGMAP_KUNIT}"
-
-        PATCHED=0
-
-        # This file has two near-identical helpers: gen_raw_regmap() (fixed
-        # by the previous step) and the older, much more widely used
-        # gen_regmap() (~19 call sites). Both suffer from the exact same
-        # incomplete backport: the body of gen_regmap() references the
-        # KUnit test object via kunit_kcalloc(test, ...), but the function
-        # signature was never updated to take struct kunit *test, and none
-        # of its callers (all of which are KUnit test cases of the form
-        # "static void foo(struct kunit *test)", so `test` is always in
-        # scope at the call site) pass it in. Confirmed against the actual
-        # downloaded source: gen_raw_regmap() already had a test_type
-        # parameter to piggyback the fix onto, but gen_regmap() has no such
-        # parameter at all, so this second, distinct instance of the bug
-        # was missed by the previous step. Build failure:
-        #   error: 'test' undeclared (first use in this function)
-        if grep -q '^static struct regmap \*gen_regmap(struct regmap_config \*config,$' "${REGMAP_KUNIT}" \
-            && grep -q 'kunit_kcalloc(test,' "${REGMAP_KUNIT}"; then
-          echo "Patching gen_regmap() to receive struct kunit *test"
-          sed -i \
-            's/^static struct regmap \*gen_regmap(struct regmap_config \*config,$/static struct regmap *gen_regmap(struct kunit *test,\n\tstruct regmap_config *config,/' \
-            "${REGMAP_KUNIT}"
-
-          # Every caller currently reads "gen_regmap(&config, &data)". Add
-          # test to each one. The (already-patched) gen_raw_regmap() callers
-          # use a distinct "gen_raw_regmap(test, &config, ..." spelling, so
-          # this plain substring match cannot collide with them.
-          BEFORE_CALLS="$(grep -Ec 'gen_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
-          if [[ "${BEFORE_CALLS}" -eq 0 ]]; then
-            echo "ERROR: expected gen_regmap(&config, ...) callers were not found."
-            exit 1
-          fi
-          sed -i 's/gen_regmap(&config,/gen_regmap(test, \&config,/g' "${REGMAP_KUNIT}"
-          PATCHED=1
-        fi
-
-        if [[ "${PATCHED}" -eq 1 ]]; then
-          echo
-          echo "Verifying regmap KUnit gen_regmap() patch:"
-          grep -n -A2 '^static struct regmap \*gen_regmap' "${REGMAP_KUNIT}"
-
-          if ! grep -q '^static struct regmap \*gen_regmap(struct kunit \*test,$' "${REGMAP_KUNIT}"; then
-            echo "ERROR: gen_regmap() signature was not patched correctly."
-            exit 1
-          fi
-
-          REMAINING="$(grep -Ec 'gen_regmap\(&config,' "${REGMAP_KUNIT}" || true)"
-          if [[ "${REMAINING}" -ne 0 ]]; then
-            echo "ERROR: ${REMAINING} unpatched gen_regmap() caller(s) remain."
-            grep -n 'gen_regmap(' "${REGMAP_KUNIT}"
-            exit 1
-          fi
-
-          PATCHED_CALLS="$(grep -Ec 'gen_regmap\(test, &config,' "${REGMAP_KUNIT}" || true)"
-          if [[ "${PATCHED_CALLS}" -eq 0 ]]; then
-            echo "ERROR: no patched gen_regmap() callers found."
-            exit 1
-          fi
-
-          echo "Patched ${PATCHED_CALLS} gen_regmap() caller(s)."
-          echo "regmap KUnit gen_regmap() backport fix applied successfully."
-        else
-          echo "No known-broken gen_regmap() pattern found; source may already be fixed upstream."
-        fi
-
-    - name: Fix known Ubuntu v3d_drv.c missing brace build issue
-      shell: bash
-      working-directory: ${{ github.workspace }}
-      run: |
-        set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
-        V3D_DRV="${SOURCE_DIR}/drivers/gpu/drm/v3d/v3d_drv.c"
-        cd "${SOURCE_DIR}"
-        echo "Checking drivers/gpu/drm/v3d/v3d_drv.c for known missing closing brace..."
-        test -f "${V3D_DRV}"
-
-        PATCHED=0
-
-        # v3d_open() is missing the closing '}' for its
-        # "for (i = 0; i < V3D_MAX_QUEUES; i++) { ... }" loop, right after
-        # the "if (ret) goto err_sched;" line. Without it, the compiler
-        # treats every subsequent top-level function in the file
-        # (v3d_postclose, v3d_show_fdinfo, map_regs,
-        # v3d_platform_drm_probe, v3d_platform_drm_remove, the
-        # module_platform_driver() init/exit thunks, etc.) as nested
-        # inside v3d_open(), producing a long cascade of unrelated-looking
-        # errors, e.g.:
-        #   error: invalid storage class for function 'v3d_postclose'
-        #   error: initializer element is not constant
-        #   error: expected declaration or statement at end of input
-        # Adding the missing '}' right after the loop's "goto err_sched;"
-        # closes the for-loop where it was always meant to end and fixes
-        # the whole cascade.
-        PYRESULT="$(python3 - "${V3D_DRV}" <<'PYEOF'
-        import sys
-        path = sys.argv[1]
-        with open(path) as f:
-            text = f.read()
-        old = "\t\tif (ret)\n\t\t\tgoto err_sched;\n\n\tv3d_perfmon_open_file(v3d_priv);"
-        new = "\t\tif (ret)\n\t\t\tgoto err_sched;\n\t}\n\n\tv3d_perfmon_open_file(v3d_priv);"
-        already = "\t\tif (ret)\n\t\t\tgoto err_sched;\n\t}\n\n\tv3d_perfmon_open_file(v3d_priv);"
-        count = text.count(old)
-        if count == 1:
-            text = text.replace(old, new)
-            with open(path, "w") as f:
-                f.write(text)
-            print("PATCHED")
-        elif text.count(already) >= 1:
-            print("ALREADY_FIXED")
-        else:
-            print("NO_MATCH")
-        PYEOF
-        )"
-        echo "Patch check result: ${PYRESULT}"
-
-        if [[ "${PYRESULT}" == "PATCHED" ]]; then
-          echo "Patched: added missing '}' to close the V3D_MAX_QUEUES for-loop in v3d_open()"
-          echo
-          echo "Verifying patch applied cleanly:"
-          grep -n -A1 'goto err_sched;' "${V3D_DRV}" | head -3
-          PATCHED=1
-        elif [[ "${PYRESULT}" == "ALREADY_FIXED" ]]; then
-          echo "Source already contains the closing brace; skipping patch."
-        else
-          echo "No known-broken pattern found; source may already be fixed upstream. Skipping patch."
-        fi
-
-        if [[ "${PATCHED}" -eq 1 ]]; then
-          echo
-          echo "v3d_drv.c missing brace fixed successfully."
-        fi
 
     - name: Configure auraOS kernel
       shell: bash
@@ -931,7 +477,6 @@ runs:
         CONFIG_DEVTMPFS=y
         CONFIG_DEVTMPFS_MOUNT=y
         CONFIG_TMPFS=y
-        CONFIG_SECURITY_APPARMOR=n
         CONFIG_RUST=n
         CONFIG_GCC_PLUGINS=n
         CONFIG_WERROR=n
@@ -959,6 +504,11 @@ runs:
         CONFIG_SHUFFLE_PAGE_ALLOCATOR=n
         CONFIG_LOCALVERSION_AUTO=n
         EOCFG
+        # NOTE: unlike the Ubuntu-sourced build, this vanilla tree keeps
+        # CONFIG_SECURITY_APPARMOR untouched (Ubuntu's incomplete backport
+        # was the reason it had to be force-disabled; vanilla apparmor
+        # builds cleanly). If you don't need AppArmor, feel free to add
+        # CONFIG_SECURITY_APPARMOR=n back to the block above.
         export KCONFIG_CONFIG="${OUTPUT_DIR}/.config"
         export KCONFIG_ALLCONFIG="${CONFIG_EXTRA}"
         case "${{ inputs.kernel-config }}" in
@@ -980,7 +530,6 @@ runs:
           --disable CONFIG_DEBUG_INFO_BTF \
           --disable CONFIG_DEBUG_INFO_BTF_MODULES \
           --disable CONFIG_UAPI_HEADER_TEST \
-          --disable CONFIG_SECURITY_APPARMOR \
           --disable CONFIG_KASAN \
           --disable CONFIG_KCSAN \
           --disable CONFIG_KFENCE \
@@ -1039,10 +588,6 @@ runs:
         echo " Enforcing CONFIG_PAGE_EXTENSION=n"
         echo "=============================================="
 
-        # Build a reverse select graph from every Kconfig file:
-        #   target <- selector
-        # A pass expands one dependency level, then olddefconfig resolves
-        # selects again. This handles chains such as A -> B -> PAGE_EXTENSION.
         GRAPH_FILE="${OUTPUT_DIR}/page-extension-select-graph.tsv"
         DIRECT_FILE="${OUTPUT_DIR}/page-extension-direct-selectors.txt"
 
@@ -1156,7 +701,6 @@ runs:
             echo "No currently enabled selectors need to be disabled in this pass."
           fi
 
-          # Always force the target off, then let Kconfig resolve all selects.
           "${SCRIPTS_CONFIG}" --file "${CONFIG_FILE}" --disable CONFIG_PAGE_EXTENSION
           make O="${OUTPUT_DIR}" olddefconfig
 
@@ -1210,10 +754,7 @@ runs:
         # Under tristate logic, "(AGP || AGP=n)" evaluates to =m whenever
         # CONFIG_AGP=m (our allmodconfig default), which caps DRM's own
         # settable range at =m -- so "--set-val CONFIG_DRM y" can never
-        # actually stick until AGP is forced to n (or y) first. This is the
-        # real root cause of the drm_fb_helper/drm.ko link failures, verified
-        # by replaying this exact override sequence through the real 6.8
-        # Kconfig tree with kconfiglib.
+        # actually stick until AGP is forced to n (or y) first.
         "${SOURCE_DIR}/scripts/config" --file "${OUTPUT_DIR}/.config" \
           --set-val CONFIG_AGP n \
           --set-val CONFIG_DRM y
@@ -1225,7 +766,7 @@ runs:
             exit 1
           fi
         done
-        DISABLED=(CONFIG_SECURITY_APPARMOR CONFIG_UAPI_HEADER_TEST CONFIG_WERROR CONFIG_RUST CONFIG_GCC_PLUGINS CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_BTF_MODULES CONFIG_KASAN CONFIG_KCSAN CONFIG_KFENCE CONFIG_KCOV CONFIG_UBSAN CONFIG_UBSAN_TRAP CONFIG_DEBUG_OBJECTS CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS CONFIG_DEBUG_LIST CONFIG_DEBUG_SG CONFIG_DEBUG_NOTIFIERS CONFIG_DEBUG_KMEMLEAK CONFIG_DEBUG_PAGEALLOC CONFIG_PAGE_POISONING CONFIG_PAGE_EXTENSION CONFIG_SLUB_DEBUG CONFIG_SLAB_FREELIST_HARDENED CONFIG_SLAB_FREELIST_RANDOM CONFIG_SHUFFLE_PAGE_ALLOCATOR)
+        DISABLED=(CONFIG_UAPI_HEADER_TEST CONFIG_WERROR CONFIG_RUST CONFIG_GCC_PLUGINS CONFIG_DEBUG_INFO_BTF CONFIG_DEBUG_INFO_BTF_MODULES CONFIG_KASAN CONFIG_KCSAN CONFIG_KFENCE CONFIG_KCOV CONFIG_UBSAN CONFIG_UBSAN_TRAP CONFIG_DEBUG_OBJECTS CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS CONFIG_DEBUG_LIST CONFIG_DEBUG_SG CONFIG_DEBUG_NOTIFIERS CONFIG_DEBUG_KMEMLEAK CONFIG_DEBUG_PAGEALLOC CONFIG_PAGE_POISONING CONFIG_PAGE_EXTENSION CONFIG_SLUB_DEBUG CONFIG_SLAB_FREELIST_HARDENED CONFIG_SLAB_FREELIST_RANDOM CONFIG_SHUFFLE_PAGE_ALLOCATOR)
         for cfg in "${DISABLED[@]}"; do
           if grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config" || grep -q "^${cfg}=m$" "${OUTPUT_DIR}/.config"; then
             echo "ERROR: ${cfg} must be disabled."
@@ -1234,13 +775,9 @@ runs:
         done
         echo
         echo "Critical configuration:"
-        grep -E '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DRM|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_UBSAN|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" || true
+        grep -E '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DRM|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_UBSAN|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" || true
         echo
         echo "Checking DRM built-in/module consistency..."
-        # If the DRM core is built as a module, nothing that links symbols
-        # from drm.ko may be built statically into vmlinux, or the final
-        # link fails with hundreds of "undefined reference to drm_*" errors
-        # after the full ~20 minute compile. Catch it here instead.
         if grep -q '^CONFIG_DRM=m$' "${OUTPUT_DIR}/.config"; then
           for cfg in CONFIG_DRM_KMS_HELPER CONFIG_DRM_FBDEV_EMULATION; do
             if grep -q "^${cfg}=y\$" "${OUTPUT_DIR}/.config"; then
@@ -1286,7 +823,7 @@ runs:
         du -sh "${BUILD_ROOT}/linux-${{ inputs.kernel-version }}" "${OUTPUT_DIR}" 2>/dev/null || true
         echo
         echo "Critical config:"
-        grep -E '^(CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" || true
+        grep -E '^(CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DEBUG_INFO_BTF|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" || true
 
     - name: Build auraOS kernel
       shell: bash
@@ -1319,7 +856,7 @@ runs:
         if (( JOBS > MAX_SAFE_JOBS )); then JOBS="${MAX_SAFE_JOBS}"; fi
         if [[ "${{ inputs.kernel-verbose }}" == "true" ]]; then VERBOSE=(V=1); else VERBOSE=(); fi
         echo "=============================================="
-        echo " Building auraOS Linux kernel"
+        echo " Building auraOS Linux kernel (vanilla ${{ inputs.kernel-version }})"
         echo "=============================================="
         echo "Kernel version:  ${{ inputs.kernel-version }}"
         echo "Local version:   ${LOCALVERSION}"
@@ -1400,7 +937,7 @@ runs:
             exit 1
           fi
         done
-        for cfg in CONFIG_SECURITY_APPARMOR CONFIG_UAPI_HEADER_TEST CONFIG_PAGE_EXTENSION; do
+        for cfg in CONFIG_UAPI_HEADER_TEST CONFIG_PAGE_EXTENSION; do
           if grep -q "^${cfg}=y$" "${OUTPUT_DIR}/.config" || grep -q "^${cfg}=m$" "${OUTPUT_DIR}/.config"; then
             echo "ERROR: ${cfg} is still enabled."
             exit 1
@@ -1484,7 +1021,7 @@ runs:
         du -xhd2 "${BUILD_ROOT}" 2>/dev/null | sort -h | tail -50
         echo
         echo "Configuration:"
-        grep -E '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_SECURITY_APPARMOR|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_KCOV|CONFIG_UBSAN|CONFIG_DEBUG_OBJECTS|CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" 2>/dev/null || true
+        grep -E '^(CONFIG_LOCALVERSION|CONFIG_MODULES|CONFIG_X86_64|CONFIG_X86|CONFIG_64BIT|CONFIG_IA32_EMULATION|CONFIG_DEBUG_INFO_BTF|CONFIG_DEBUG_INFO_BTF_MODULES|CONFIG_UAPI_HEADER_TEST|CONFIG_WERROR|CONFIG_RUST|CONFIG_GCC_PLUGINS|CONFIG_KASAN|CONFIG_KCSAN|CONFIG_KFENCE|CONFIG_KCOV|CONFIG_UBSAN|CONFIG_DEBUG_OBJECTS|CONFIG_DRM_I915_SW_FENCE_DEBUG_OBJECTS|CONFIG_PAGE_EXTENSION)=' "${OUTPUT_DIR}/.config" 2>/dev/null || true
         echo
         echo "Kernel release:"
         if [[ -f "${OUTPUT_DIR}/.config" ]]; then
@@ -1503,13 +1040,12 @@ runs:
         RELEASE="$(make -C "${SOURCE_DIR}" O="${OUTPUT_DIR}" -s kernelrelease)"
         mkdir -p "${PACKAGE_DIR}"
         {
-          echo "auraOS kernel"
+          echo "auraOS kernel (vanilla)"
           echo "Kernel version: ${{ inputs.kernel-version }}"
-          echo "Ubuntu source revision: ${{ inputs.kernel-source-revision }}"
+          echo "Source: kernel.org (vanilla, no distro backports)"
           echo "Kernel release: ${RELEASE}"
           echo "Architecture: x86_64"
           echo "Kernel config: ${{ inputs.kernel-config }}"
-          echo "AppArmor: disabled"
           echo "UAPI header test: disabled"
           echo "Rust: disabled"
           echo "GCC plugins: disabled"
@@ -1590,7 +1126,7 @@ runs:
     - name: Upload auraOS kernel
       uses: actions/upload-artifact@v6
       with:
-        name: auraOS-linux-6.8.0-138-generic
+        name: auraOS-linux-${{ inputs.kernel-version }}-generic
         path: |
           ${{ github.workspace }}/auraOS-kernel/auraOS-kernel-*-x86_64.tar.gz
           ${{ github.workspace }}/auraOS-kernel/auraOS-kernel-*-x86_64.tar.gz.sha256
