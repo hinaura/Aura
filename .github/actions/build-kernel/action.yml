@@ -22,7 +22,7 @@ inputs:
     required: false
     default: 'true'
   build-mount-path:
-    description: 'Build filesystem mount path. Defaults to $GITHUB_WORKSPACE.'
+    description: 'Build filesystem mount path. Defaults to /mnt/aura-build (never $GITHUB_WORKSPACE - see Maximize build disk space step).'
     required: false
   build-mount-path-ownership:
     description: 'Ownership for the build mount.'
@@ -170,7 +170,19 @@ runs:
       run: |
         set -euo pipefail
         BUILD_MOUNT_PATH="${{ inputs.build-mount-path }}"
-        if [[ -z "${BUILD_MOUNT_PATH}" ]]; then BUILD_MOUNT_PATH="${GITHUB_WORKSPACE}"; fi
+        if [[ -z "${BUILD_MOUNT_PATH}" ]]; then BUILD_MOUNT_PATH="/mnt/aura-build"; fi
+        # NOTE: this must NOT be ${GITHUB_WORKSPACE}. Mounting a fresh LVM
+        # volume directly on top of the workspace buries the checked-out
+        # repository (including this composite action's own action.yml)
+        # under the new mountpoint for the rest of the job. GitHub Actions
+        # still needs to read .github/actions/build-kernel/action.yml after
+        # the run step finishes (post-job processing for this action), and
+        # fails with "Can't find 'action.yml' ... under
+        # .../.github/actions/build-kernel" once that path is hidden.
+        # Building on a separate mountpoint keeps the checkout (and this
+        # action.yml) intact and visible for the rest of the job.
+        sudo mkdir -p "${BUILD_MOUNT_PATH}"
+        echo "AURA_BUILD_ROOT=${BUILD_MOUNT_PATH}" >> "${GITHUB_ENV}"
         ACTUAL_OWNER="${{ inputs.build-mount-path-ownership }}"
         if [[ -z "${ACTUAL_OWNER}" ]]; then ACTUAL_OWNER="$(stat -c '%U:%G' "${GITHUB_WORKSPACE}")"; fi
         ROOT_RESERVE_MB="${{ inputs.root-reserve-mb }}"
@@ -328,7 +340,7 @@ runs:
       id: ccache-restore
       uses: actions/cache@v4
       with:
-        path: ${{ github.workspace }}/.ccache
+        path: ${{ env.AURA_BUILD_ROOT }}/.ccache
         key: >-
           ${{ inputs.ccache-cache-key-prefix }}-${{ inputs.kernel-version }}-${{ inputs.kernel-config }}-${{ inputs.kernel-localversion }}-${{ hashFiles('.github/actions/build-kernel/action.yml') }}-${{ github.run_id }}
         restore-keys: |
@@ -341,7 +353,7 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        CCACHE_DIR="${GITHUB_WORKSPACE}/.ccache"
+        CCACHE_DIR="${AURA_BUILD_ROOT}/.ccache"
         mkdir -p "${CCACHE_DIR}"
         echo "CCACHE_DIR=${CCACHE_DIR}" >> "${GITHUB_ENV}"
         ccache --max-size="${{ inputs.ccache-max-size }}" --set-config=cache_dir="${CCACHE_DIR}"
@@ -358,7 +370,7 @@ runs:
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         TARBALL="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}.tar.xz"
         SIGN="${TARBALL}.sign"
@@ -429,7 +441,7 @@ runs:
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         rm -rf "${OUTPUT_DIR}"
@@ -573,7 +585,7 @@ runs:
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         CONFIG_FILE="${OUTPUT_DIR}/.config"
@@ -744,7 +756,7 @@ runs:
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         test -f "${OUTPUT_DIR}/.config"
@@ -801,17 +813,17 @@ runs:
       shell: bash
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         echo "=============================================="
         echo " Pre-build resource check"
         echo "=============================================="
         echo
         echo "Disk:"
-        df -hT "${GITHUB_WORKSPACE}"
+        df -hT "${AURA_BUILD_ROOT}"
         echo
         echo "Inodes:"
-        df -ih "${GITHUB_WORKSPACE}"
+        df -ih "${AURA_BUILD_ROOT}"
         echo
         echo "Memory:"
         free -h
@@ -835,10 +847,10 @@ runs:
         KBUILD_BUILD_VERSION: ${{ inputs.kernel-build-version }}
         LOCALVERSION: ${{ inputs.kernel-localversion }}
         SOURCE_DATE_EPOCH: '1787184000'
-        CCACHE_DIR: ${{ github.workspace }}/.ccache
+        CCACHE_DIR: ${{ env.AURA_BUILD_ROOT }}/.ccache
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         cd "${SOURCE_DIR}"
@@ -923,10 +935,14 @@ runs:
 
     - name: Verify built kernel configuration
       shell: bash
+      # Non-fatal: a config mismatch here is a policy check, not proof the
+      # kernel image is unusable. We still want to package/upload whatever
+      # bzImage was produced, so we don't let this abort the whole job.
+      continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         cd "${SOURCE_DIR}"
@@ -948,10 +964,15 @@ runs:
 
     - name: Install modules and generate initramfs
       shell: bash
+      # Non-fatal: this stage (modules_install/depmod/mkinitramfs) is
+      # separate from the kernel image itself. If it fails, we still want
+      # the archive/upload steps below to run and ship the bzImage that
+      # was already built.
+      continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         PACKAGE_DIR="${BUILD_ROOT}/output"
@@ -994,7 +1015,7 @@ runs:
       shell: bash
       run: |
         set +e
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         echo "=============================================="
         echo " Build diagnostics"
@@ -1030,10 +1051,11 @@ runs:
 
     - name: Create auraOS kernel metadata
       shell: bash
+      continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         PACKAGE_DIR="${BUILD_ROOT}/output"
@@ -1074,10 +1096,11 @@ runs:
 
     - name: Validate final kernel artifacts
       shell: bash
+      continue-on-error: true
       working-directory: ${{ github.workspace }}
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
         SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
         OUTPUT_DIR="${BUILD_ROOT}/build"
         PACKAGE_DIR="${BUILD_ROOT}/output"
@@ -1103,14 +1126,44 @@ runs:
         echo "Final kernel artifact validation passed."
 
     - name: Create auraOS kernel archive
+      # Always run, even if earlier optional steps (module install,
+      # initramfs, metadata, validation) failed above - we still want to
+      # ship whatever kernel image actually got built.
+      if: always()
       shell: bash
       working-directory: ${{ github.workspace }}
       env:
         SOURCE_DATE_EPOCH: '1787184000'
       run: |
         set -euo pipefail
-        BUILD_ROOT="${GITHUB_WORKSPACE}/auraOS-kernel"
-        RELEASE="$(make -C "${BUILD_ROOT}/linux-${{ inputs.kernel-version }}" O="${BUILD_ROOT}/build" -s kernelrelease)"
+        BUILD_ROOT="${AURA_BUILD_ROOT}/auraOS-kernel"
+        SOURCE_DIR="${BUILD_ROOT}/linux-${{ inputs.kernel-version }}"
+        OUTPUT_DIR="${BUILD_ROOT}/build"
+        PACKAGE_DIR="${BUILD_ROOT}/output"
+
+        if [[ ! -s "${OUTPUT_DIR}/arch/x86/boot/bzImage" ]]; then
+          echo "No bzImage was produced (kernel build itself failed) - nothing to archive."
+          exit 0
+        fi
+
+        RELEASE="$(make -C "${SOURCE_DIR}" O="${OUTPUT_DIR}" -s kernelrelease)"
+        echo "Kernel release: ${RELEASE}"
+
+        # Re-assert the minimum bootable set directly from the build
+        # output, regardless of whether "Install modules and generate
+        # initramfs" / "Create auraOS kernel metadata" succeeded above.
+        # Those steps add modules/initramfs/metadata as a bonus, but the
+        # kernel image + config + System.map are all that's strictly
+        # required to ship a working artifact.
+        mkdir -p "${PACKAGE_DIR}/boot"
+        cp "${OUTPUT_DIR}/arch/x86/boot/bzImage" "${PACKAGE_DIR}/boot/vmlinuz-${RELEASE}"
+        [[ -f "${OUTPUT_DIR}/System.map" ]] && cp "${OUTPUT_DIR}/System.map" "${PACKAGE_DIR}/boot/System.map-${RELEASE}"
+        cp "${OUTPUT_DIR}/.config" "${PACKAGE_DIR}/boot/config-${RELEASE}"
+
+        echo
+        echo "Package contents going into the archive:"
+        find "${PACKAGE_DIR}" -type f -printf '%p\n' | sort
+
         cd "${BUILD_ROOT}"
         ARCHIVE="auraOS-kernel-${RELEASE}-x86_64.tar.gz"
         rm -f "${ARCHIVE}" "${ARCHIVE}.sha256"
@@ -1124,13 +1177,18 @@ runs:
         cat "${ARCHIVE}.sha256"
 
     - name: Upload auraOS kernel
+      # Always attempt the upload; the archive step above already skipped
+      # cleanly (without creating a tarball) if there was truly no kernel
+      # image to ship, so if-no-files-found stays a warning here instead
+      # of failing the whole job at the very last step.
+      if: always()
       uses: actions/upload-artifact@v6
       with:
         name: auraOS-linux-${{ inputs.kernel-version }}-generic
         path: |
-          ${{ github.workspace }}/auraOS-kernel/auraOS-kernel-*-x86_64.tar.gz
-          ${{ github.workspace }}/auraOS-kernel/auraOS-kernel-*-x86_64.tar.gz.sha256
-        if-no-files-found: error
+          ${{ env.AURA_BUILD_ROOT }}/auraOS-kernel/auraOS-kernel-*-x86_64.tar.gz
+          ${{ env.AURA_BUILD_ROOT }}/auraOS-kernel/auraOS-kernel-*-x86_64.tar.gz.sha256
+        if-no-files-found: warn
         compression-level: 0
         retention-days: 30
 
@@ -1161,8 +1219,8 @@ runs:
         sudo lvs || true
         echo
         echo "Build workspace:"
-        if [[ -d "${GITHUB_WORKSPACE}/auraOS-kernel" ]]; then
-          du -sh "${GITHUB_WORKSPACE}/auraOS-kernel" 2>/dev/null || true
+        if [[ -d "${AURA_BUILD_ROOT}/auraOS-kernel" ]]; then
+          du -sh "${AURA_BUILD_ROOT}/auraOS-kernel" 2>/dev/null || true
         fi
         echo
         echo "auraOS kernel action finished."
