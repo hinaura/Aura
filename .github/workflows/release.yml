@@ -1,17 +1,20 @@
 name: Build auraOS Kernel
 
 on:
-  workflow_dispatch: 
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   build:
+    name: Build kernel
     runs-on: ubuntu-latest
-    
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
-      
       - name: Run auraOS Build Action
         uses: ./.github/actions/build-kernel
         with:
@@ -20,3 +23,12 @@ jobs:
           remove-haskell: 'true'
           remove-codeql: 'true'
           remove-docker-images: 'true'
+
+      - name: Upload kernel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: auraOS-linux-6.12.104-generic
+          path: |
+            auraOS-linux-6.12.104-generic.zip
+          if-no-files-found: error
+          retention-days: 90
