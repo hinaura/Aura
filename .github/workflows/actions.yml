@@ -1,5 +1,3 @@
-actions.yml
-
 name: Publish auraOS Release
 
 on:
@@ -16,7 +14,6 @@ permissions:
 
 jobs:
   publish:
-    name: Publish Release
     runs-on: ubuntu-latest
 
     steps:
@@ -29,13 +26,7 @@ jobs:
           path: ./release
           github_token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Check downloaded files
-        run: |
-          ls -lh ./release
-          test -f ./release/auraOS-kernel-6.12.104-generic-auraOS-x86_64.tar.gz
-          test -f ./release/auraOS-kernel-6.12.104-generic-auraOS-x86_64.tar.gz.sha256
-
-      - name: Create GitHub Release
+      - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ inputs.tag }}
