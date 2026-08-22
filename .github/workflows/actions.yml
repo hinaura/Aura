@@ -1,0 +1,41 @@
+name: Publish auraOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag"
+        required: true
+        default: "v1.0.0"
+
+      name:
+        description: "Release name"
+        required: true
+        default: "auraOS Release"
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    name: Publish Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download latest successful build
+        uses: dawidd6/action-download-artifact@v23
+        with:
+          workflow: release.yml
+          workflow_conclusion: success
+          name: auraOS-linux-6.12.104-generic
+          path: ./release
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag }}
+          name: ${{ inputs.name }}
+          files: ./release/auraOS-linux-6.12.104-generic.zip
+          generate_release_notes: true
